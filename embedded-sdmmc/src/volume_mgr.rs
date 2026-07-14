@@ -874,6 +874,75 @@ where
         }
     }
 
+    /// Create a file with a VFAT long name and a caller-supplied unique 8.3 alias.
+    ///
+    /// Existing files continue to be opened through their short alias. This
+    /// operation only creates a new file and returns [`Error::FileAlreadyExists`]
+    /// if the alias is already present.
+    pub fn create_file_in_dir_lfn<N>(
+        &self,
+        directory: RawDirectory,
+        long_name: &str,
+        short_alias: N,
+    ) -> Result<RawFile, Error<D::Error>>
+    where
+        N: ToShortFileName,
+    {
+        let mut data = self.data.try_borrow_mut().map_err(|_| Error::LockError)?;
+        let data = data.deref_mut();
+
+        if data.open_files.is_full() {
+            return Err(Error::TooManyOpenFiles);
+        }
+
+        let directory_idx = data.get_dir_by_id(directory)?;
+        let volume_id = data.open_dirs[directory_idx].raw_volume;
+        let volume_idx = data.get_volume_by_id(volume_id)?;
+        let short_alias = short_alias
+            .to_short_filename()
+            .map_err(Error::FilenameError)?;
+
+        match &data.open_volumes[volume_idx].volume_type {
+            VolumeType::Fat(fat) => match fat.find_directory_entry(
+                &mut data.block_cache,
+                &data.open_dirs[directory_idx],
+                &short_alias,
+            ) {
+                Ok(_) => return Err(Error::FileAlreadyExists),
+                Err(Error::NotFound) => {}
+                Err(error) => return Err(error),
+            },
+        }
+
+        let cluster = data.open_dirs[directory_idx].cluster;
+        let attributes = Attributes::create_from_fat(0);
+        let entry = match &mut data.open_volumes[volume_idx].volume_type {
+            VolumeType::Fat(fat) => fat.write_new_directory_entry_lfn(
+                &mut data.block_cache,
+                &self.time_source,
+                cluster,
+                long_name,
+                short_alias,
+                attributes,
+            )?,
+        };
+
+        let file_id = RawFile(data.id_generator.generate());
+        let file = FileInfo {
+            raw_file: file_id,
+            raw_volume: volume_id,
+            current_cluster: (0, entry.cluster),
+            current_offset: 0,
+            mode: Mode::ReadWriteCreate,
+            entry,
+            dirty: false,
+        };
+        unsafe {
+            data.open_files.push_unchecked(file);
+        }
+        Ok(file_id)
+    }
+
     /// Delete a closed file or empty directory with the given filename, if it exists.
     pub fn delete_entry_in_dir<N>(
         &self,

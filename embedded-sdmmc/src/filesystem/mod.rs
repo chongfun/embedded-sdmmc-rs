@@ -23,6 +23,7 @@ pub use self::handles::{Handle, HandleGenerator};
 pub use self::timestamp::{TimeSource, Timestamp};
 
 pub(crate) use self::directory::DirectoryInfo;
+pub(crate) use self::filename::validate_long_filename;
 pub(crate) use self::files::FileInfo;
 
 // ****************************************************************************
