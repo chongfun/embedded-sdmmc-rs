@@ -637,6 +637,123 @@ fn delete_directory() {
     ));
 }
 
+#[test]
+fn create_read_and_delete_long_named_files() {
+    let time_source = utils::make_time_source();
+    let disk = utils::make_block_device(utils::DISK_SOURCE).unwrap();
+    let volume_mgr = embedded_sdmmc::VolumeManager::new(disk, time_source);
+
+    // Exercise a FAT16 subdirectory.
+    let fat16_volume = volume_mgr
+        .open_raw_volume(embedded_sdmmc::VolumeIdx(0))
+        .expect("open FAT16 volume");
+    let fat16_root = volume_mgr
+        .open_root_dir(fat16_volume)
+        .expect("open FAT16 root");
+    let fat16_dir = volume_mgr
+        .open_dir(fat16_root, "TEST")
+        .expect("open FAT16 test dir");
+    let file = volume_mgr
+        .create_file_in_dir_lfn(
+            fat16_dir,
+            "Wireless upload compatibility.epub",
+            "WIREL001.EPU",
+        )
+        .expect("create FAT16 LFN file");
+    volume_mgr.write(file, b"EPUB-FAT16").unwrap();
+    volume_mgr.close_file(file).unwrap();
+
+    let mut found = false;
+    let mut storage = [0u8; 128];
+    let mut lfn_buffer = LfnBuffer::new(&mut storage);
+    volume_mgr
+        .iterate_dir_lfn(fat16_dir, &mut lfn_buffer, |entry, long_name| {
+            if entry.name == ShortFileName::create_from_str("WIREL001.EPU").unwrap() {
+                found = true;
+                assert_eq!(long_name, Some("Wireless upload compatibility.epub"));
+                assert_eq!(entry.size, 10);
+            }
+        })
+        .unwrap();
+    assert!(found);
+    volume_mgr.close_dir(fat16_dir).unwrap();
+    volume_mgr.close_dir(fat16_root).unwrap();
+    volume_mgr.close_volume(fat16_volume).unwrap();
+
+    // Exercise a FAT32 directory with the LFN chain crossing a sector boundary.
+    let fat32_volume = volume_mgr
+        .open_raw_volume(embedded_sdmmc::VolumeIdx(1))
+        .expect("open FAT32 volume");
+    let fat32_root = volume_mgr
+        .open_root_dir(fat32_volume)
+        .expect("open FAT32 root");
+    volume_mgr.make_dir_in_dir(fat32_root, "LFNTEST").unwrap();
+    let fat32_dir = volume_mgr.open_dir(fat32_root, "LFNTEST").unwrap();
+    for index in 0..12 {
+        let name = format!("FILL{index:04}.TMP");
+        let filler = volume_mgr
+            .open_file_in_dir(fat32_dir, name.as_str(), Mode::ReadWriteCreate)
+            .unwrap();
+        volume_mgr.close_file(filler).unwrap();
+    }
+
+    let long_name = "Wireless upload 😀 cross-firmware compatibility.epub";
+    let alias = "WIREL002.EPU";
+    let file = volume_mgr
+        .create_file_in_dir_lfn(fat32_dir, long_name, alias)
+        .expect("create cross-sector FAT32 LFN file");
+    volume_mgr.write(file, b"EPUB-FAT32").unwrap();
+    volume_mgr.close_file(file).unwrap();
+
+    let mut found = false;
+    let mut storage = [0u8; 192];
+    let mut lfn_buffer = LfnBuffer::new(&mut storage);
+    volume_mgr
+        .iterate_dir_lfn(fat32_dir, &mut lfn_buffer, |entry, given_long_name| {
+            if entry.name == ShortFileName::create_from_str(alias).unwrap() {
+                found = true;
+                assert_eq!(given_long_name, Some(long_name));
+                assert_eq!(entry.size, 10);
+            }
+        })
+        .unwrap();
+    assert!(found);
+
+    let file = volume_mgr
+        .open_file_in_dir(fat32_dir, alias, Mode::ReadOnly)
+        .unwrap();
+    let mut contents = [0u8; 10];
+    assert_eq!(
+        volume_mgr.read(file, &mut contents).unwrap(),
+        contents.len()
+    );
+    assert_eq!(&contents, b"EPUB-FAT32");
+    volume_mgr.close_file(file).unwrap();
+
+    assert!(matches!(
+        volume_mgr.create_file_in_dir_lfn(fat32_dir, "Another.epub", alias),
+        Err(embedded_sdmmc::Error::FileAlreadyExists)
+    ));
+    assert!(matches!(
+        volume_mgr.create_file_in_dir_lfn(fat32_dir, "Invalid?.epub", "INVALID.EPU"),
+        Err(embedded_sdmmc::Error::FilenameError(
+            embedded_sdmmc::FilenameError::InvalidCharacter
+        ))
+    ));
+
+    volume_mgr.delete_file_in_dir(fat32_dir, alias).unwrap();
+    let mut found_after_delete = false;
+    let mut storage = [0u8; 192];
+    let mut lfn_buffer = LfnBuffer::new(&mut storage);
+    volume_mgr
+        .iterate_dir_lfn(fat32_dir, &mut lfn_buffer, |entry, long_name| {
+            found_after_delete |= entry.name == ShortFileName::create_from_str(alias).unwrap()
+                || long_name == Some("Wireless upload 😀 cross-firmware compatibility.epub");
+        })
+        .unwrap();
+    assert!(!found_after_delete);
+}
+
 // ****************************************************************************
 //
 // End Of File

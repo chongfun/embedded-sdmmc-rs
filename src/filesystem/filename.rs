@@ -5,18 +5,46 @@ use crate::trace;
 
 /// Various filename related errors that can occur.
 #[cfg_attr(feature = "defmt-log", derive(defmt::Format))]
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FilenameError {
     /// Tried to create a file with an invalid character.
     InvalidCharacter,
     /// Tried to create a file with no file name.
     FilenameEmpty,
-    /// Given name was too long (we are limited to 8.3).
+    /// Given name was too long for its on-disk representation.
     NameTooLong,
     /// Can't start a file with a period, or after 8 characters.
     MisplacedPeriod,
     /// Can't extract utf8 from file name
     Utf8Error,
+}
+
+/// Validate a VFAT long file name and return its UTF-16 code-unit length.
+///
+/// VFAT stores at most 255 UTF-16 code units. Trailing spaces and periods are
+/// rejected because they cannot be addressed reliably by common FAT clients.
+pub(crate) fn validate_long_filename(name: &str) -> Result<usize, FilenameError> {
+    if name.is_empty() || name == "." || name == ".." {
+        return Err(FilenameError::FilenameEmpty);
+    }
+    if name.ends_with([' ', '.']) {
+        return Err(FilenameError::InvalidCharacter);
+    }
+
+    let mut utf16_len = 0;
+    for ch in name.chars() {
+        match ch {
+            '\u{0000}'..='\u{001F}' | '"' | '*' | '/' | ':' | '<' | '>' | '?' | '\\' | '|' => {
+                return Err(FilenameError::InvalidCharacter);
+            }
+            _ => {}
+        }
+        utf16_len += ch.len_utf16();
+        if utf16_len > 255 {
+            return Err(FilenameError::NameTooLong);
+        }
+    }
+    Ok(utf16_len)
 }
 
 /// Describes things we can convert to short 8.3 filenames

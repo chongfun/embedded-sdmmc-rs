@@ -203,6 +203,21 @@ where
         Ok(f.to_file(self.volume_mgr))
     }
 
+    /// Create a file with a VFAT long name and a caller-supplied unique 8.3 alias.
+    pub fn create_file_in_dir_lfn<N>(
+        &self,
+        long_name: &str,
+        short_alias: N,
+    ) -> Result<crate::File<'_, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>, crate::Error<D::Error>>
+    where
+        N: super::ToShortFileName,
+    {
+        let file =
+            self.volume_mgr
+                .create_file_in_dir_lfn(self.raw_directory, long_name, short_alias)?;
+        Ok(file.to_file(self.volume_mgr))
+    }
+
     /// Delete a closed file with the given filename, if it exists.
     pub fn delete_file_in_dir<N>(&self, name: N) -> Result<(), Error<D::Error>>
     where
