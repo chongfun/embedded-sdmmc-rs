@@ -509,7 +509,7 @@ where
                 // we are opening an existing file
                 Some(entry)
             }
-            Err(_)
+            Err(Error::NotFound)
                 if (mode == Mode::ReadWriteCreate)
                     | (mode == Mode::ReadWriteCreateOrTruncate)
                     | (mode == Mode::ReadWriteCreateOrAppend) =>
@@ -518,10 +518,16 @@ where
                 // asked us to create it
                 None
             }
-            _ => {
+            Err(Error::NotFound) => {
                 // We are opening a non-existant file, and that's not OK.
                 return Err(Error::NotFound);
             }
+            // A lookup that failed for any other reason did not establish
+            // that the file is missing. Reporting it as NotFound would tell
+            // a caller that the name is free -- and in the create modes
+            // above, would go on to create a second entry for a name that
+            // may well already exist.
+            Err(error) => return Err(error),
         };
 
         // Check if it's open already

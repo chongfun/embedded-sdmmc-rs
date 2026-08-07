@@ -985,7 +985,12 @@ impl FatVolume {
                         first_dir_block_num = self.cluster_to_block(n);
                         Some(n)
                     }
-                    _ => None,
+                    // The chain ending is what "no more entries" means; a
+                    // chain we could not follow is not the same answer, and
+                    // callers that treat NotFound as proof of absence need
+                    // to be able to tell those apart.
+                    Err(Error::EndOfFile) => None,
+                    Err(error) => return Err(error),
                 };
             } else {
                 current_cluster = None;
@@ -1029,7 +1034,11 @@ impl FatVolume {
                     }
                 }
             }
-            current_cluster = self.next_cluster(block_cache, cluster).ok();
+            current_cluster = match self.next_cluster(block_cache, cluster) {
+                Ok(n) => Some(n),
+                Err(Error::EndOfFile) => None,
+                Err(error) => return Err(error),
+            };
         }
         Ok(())
     }
@@ -1082,7 +1091,8 @@ impl FatVolume {
                                 first_dir_block_num = self.cluster_to_block(n);
                                 Some(n)
                             }
-                            _ => None,
+                            Err(Error::EndOfFile) => None,
+                            Err(error) => return Err(error),
                         };
                     } else {
                         current_cluster = None;
@@ -1108,7 +1118,11 @@ impl FatVolume {
                             x => return x,
                         }
                     }
-                    current_cluster = self.next_cluster(block_cache, cluster).ok()
+                    current_cluster = match self.next_cluster(block_cache, cluster) {
+                        Ok(n) => Some(n),
+                        Err(Error::EndOfFile) => None,
+                        Err(error) => return Err(error),
+                    }
                 }
                 Err(Error::NotFound)
             }
