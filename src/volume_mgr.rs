@@ -728,6 +728,70 @@ where
         Ok(file_id)
     }
 
+    /// Give an existing file a second name, in this or another directory on
+    /// the same volume.
+    ///
+    /// Writes a long-named directory entry pointing at `source`'s cluster
+    /// chain, size, attributes and timestamps. No file data is read or
+    /// copied, and no clusters are allocated.
+    ///
+    /// This is half of a move. The other half is [`Self::delete_file_in_dir`],
+    /// which takes a name away without freeing the chain behind it. Between
+    /// the two calls the chain has two names, and that window is visible to a
+    /// caller that crashes in it: recovery must *unlink* the name it does not
+    /// want, never delete-and-reclaim it, because reclaiming frees clusters
+    /// the surviving name still points at. A caller that needs the window to
+    /// be recoverable should record its intent durably before starting.
+    ///
+    /// Fails with [`Error::FileAlreadyExists`] if `short_alias` is taken in
+    /// the destination. The long name is not checked for duplicates -- FAT
+    /// does not require long names to be unique, and callers that need that
+    /// have to enforce it themselves.
+    pub fn link_file_in_dir_lfn<N>(
+        &self,
+        directory: RawDirectory,
+        long_name: &str,
+        short_alias: N,
+        source: &DirEntry,
+    ) -> Result<(), Error<D::Error>>
+    where
+        N: ToShortFileName,
+    {
+        let mut data = self.data.try_borrow_mut().map_err(|_| Error::LockError)?;
+        let data = data.deref_mut();
+
+        let directory_idx = data.get_dir_by_id(directory)?;
+        let volume_id = data.open_dirs[directory_idx].raw_volume;
+        let volume_idx = data.get_volume_by_id(volume_id)?;
+        let short_alias = short_alias
+            .to_short_filename()
+            .map_err(Error::FilenameError)?;
+
+        match &data.open_volumes[volume_idx].volume_type {
+            VolumeType::Fat(fat) => match fat.find_directory_entry(
+                &mut data.block_cache,
+                &data.open_dirs[directory_idx],
+                &short_alias,
+            ) {
+                Ok(_) => return Err(Error::FileAlreadyExists),
+                Err(Error::NotFound) => {}
+                Err(error) => return Err(error),
+            },
+        }
+
+        let cluster = data.open_dirs[directory_idx].cluster;
+        match &mut data.open_volumes[volume_idx].volume_type {
+            VolumeType::Fat(fat) => fat.write_linked_directory_entry_lfn(
+                &mut data.block_cache,
+                cluster,
+                long_name,
+                short_alias,
+                source,
+            )?,
+        };
+        Ok(())
+    }
+
     /// Delete a closed file with the given filename, if it exists.
     pub fn delete_file_in_dir<N>(
         &self,

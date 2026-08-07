@@ -2,7 +2,7 @@
 
 use crate::{
     Attributes, Block, BlockCache, BlockCount, BlockDevice, BlockIdx, ClusterId, DirEntry,
-    DirectoryInfo, Error, LfnBuffer, ShortFileName, TimeSource, VolumeType, debug,
+    DirectoryInfo, Error, LfnBuffer, ShortFileName, TimeSource, Timestamp, VolumeType, debug,
     fat::{
         Bpb, Fat16Info, Fat32Info, FatSpecificInfo, FatType, InfoSector, OnDiskDirEntry,
         RESERVED_ENTRIES,
@@ -676,6 +676,70 @@ impl FatVolume {
         D: BlockDevice,
         T: TimeSource,
     {
+        let ctime = time_source.get_timestamp();
+        self.write_directory_entry_lfn(
+            block_cache,
+            dir_cluster,
+            long_name,
+            short_name,
+            attributes,
+            ClusterId::EMPTY,
+            0,
+            ctime,
+            ctime,
+        )
+    }
+
+    /// Write a long-named directory entry describing a cluster chain that
+    /// already exists.
+    ///
+    /// This is half of a same-volume move: it gives an existing chain a second
+    /// name, and [`Self::delete_directory_entry`] then takes the first one
+    /// away without touching the chain itself. Between those two writes the
+    /// chain has two names, and a caller that crashes there must unlink one of
+    /// them rather than delete it -- deleting reclaims clusters that both
+    /// names still point at.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn write_linked_directory_entry_lfn<D>(
+        &mut self,
+        block_cache: &mut BlockCache<D>,
+        dir_cluster: ClusterId,
+        long_name: &str,
+        short_name: ShortFileName,
+        source: &DirEntry,
+    ) -> Result<DirEntry, Error<D::Error>>
+    where
+        D: BlockDevice,
+    {
+        self.write_directory_entry_lfn(
+            block_cache,
+            dir_cluster,
+            long_name,
+            short_name,
+            source.attributes,
+            source.cluster,
+            source.size,
+            source.ctime,
+            source.mtime,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn write_directory_entry_lfn<D>(
+        &mut self,
+        block_cache: &mut BlockCache<D>,
+        dir_cluster: ClusterId,
+        long_name: &str,
+        short_name: ShortFileName,
+        attributes: Attributes,
+        cluster: ClusterId,
+        size: u32,
+        ctime: Timestamp,
+        mtime: Timestamp,
+    ) -> Result<DirEntry, Error<D::Error>>
+    where
+        D: BlockDevice,
+    {
         let utf16_len = validate_long_filename(long_name).map_err(Error::FilenameError)?;
         let lfn_count = utf16_len.div_ceil(LFN_CHARS_PER_ENTRY);
         let slots_needed = lfn_count + 1;
@@ -705,16 +769,17 @@ impl FatVolume {
             written += 1;
         }
 
-        let ctime = time_source.get_timestamp();
         let short_slot = slots[lfn_count];
-        let entry = DirEntry::new(
+        let mut entry = DirEntry::new(
             short_name,
             attributes,
-            ClusterId::EMPTY,
+            cluster,
             ctime,
             short_slot.block,
             short_slot.offset,
         );
+        entry.mtime = mtime;
+        entry.size = size;
         let raw = entry.serialize(self.get_fat_type());
         if let Err(error) = write_directory_slot(block_cache, short_slot, &raw) {
             let _ = mark_directory_slots_deleted(block_cache, &slots[..written]);

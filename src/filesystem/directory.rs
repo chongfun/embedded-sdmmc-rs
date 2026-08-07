@@ -218,7 +218,32 @@ where
         Ok(file.to_file(self.volume_mgr))
     }
 
+    /// Give an existing file a second name, here or in another directory on
+    /// the same volume.
+    ///
+    /// Copies no data and allocates no clusters: the new entry points at the
+    /// chain `source` already describes. Paired with [`Self::delete_file_in_dir`]
+    /// this is a move; see [`crate::VolumeManager::link_file_in_dir_lfn`] for
+    /// what is true in the window between the two.
+    pub fn link_file_in_dir_lfn<N>(
+        &self,
+        long_name: &str,
+        short_alias: N,
+        source: &DirEntry,
+    ) -> Result<(), Error<D::Error>>
+    where
+        N: ToShortFileName,
+    {
+        self.volume_mgr
+            .link_file_in_dir_lfn(self.raw_directory, long_name, short_alias, source)
+    }
+
     /// Delete a closed file with the given filename, if it exists.
+    ///
+    /// This removes the directory entry -- including its long-name chain --
+    /// and does *not* free the file's clusters. For an ordinary delete that
+    /// is a leak unless the caller truncates first; for the second half of a
+    /// move it is exactly right, since the chain still has another name.
     pub fn delete_file_in_dir<N>(&self, name: N) -> Result<(), Error<D::Error>>
     where
         N: ToShortFileName,

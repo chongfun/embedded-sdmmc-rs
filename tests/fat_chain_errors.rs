@@ -25,7 +25,8 @@ struct FailRegion<D> {
 #[derive(Debug)]
 enum FailError {
     Injected,
-    Inner(utils::Error),
+    /// Carried so a real device failure is distinguishable in test output.
+    Inner(#[allow(dead_code)] utils::Error),
 }
 
 impl<D> BlockDevice for FailRegion<D>
