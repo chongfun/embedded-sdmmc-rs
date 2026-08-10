@@ -368,23 +368,45 @@ where
     }
 
     /// Write back a block you read with [`Self::read_mut`] and then modified.
+    ///
+    /// If the write fails the cached copy is dropped, because it holds changes
+    /// that are not on the disk and must not be able to reach it later. The
+    /// cache is a single sector, so a caller that modifies a second entry in
+    /// the same sector after a failed write would otherwise write both of them
+    /// out together -- committing the change it had just been told had failed.
     pub fn write_back(&mut self) -> Result<(), D::Error> {
-        self.block_device.write(
+        let result = self.block_device.write(
             &self.block,
             self.block_idx.expect("write_back with no read"),
-        )
+        );
+        if result.is_err() {
+            self.invalidate();
+        }
+        result
     }
 
     /// Write back a block you read with [`Self::read_mut`] and then modified, but to two locations.
     ///
     /// This is useful for updating two File Allocation Tables.
+    ///
+    /// As with [`Self::write_back`], a failure drops the cached copy.
     pub fn write_back_with_duplicate(&mut self, duplicate: BlockIdx) -> Result<(), D::Error> {
-        self.block_device.write(
-            &self.block,
-            self.block_idx.expect("write_back with no read"),
-        )?;
-        self.block_device.write(&self.block, duplicate)?;
-        Ok(())
+        let result = (|| {
+            self.block_device.write(
+                &self.block,
+                self.block_idx.expect("write_back with no read"),
+            )?;
+            self.block_device.write(&self.block, duplicate)
+        })();
+        if result.is_err() {
+            self.invalidate();
+        }
+        result
+    }
+
+    /// Forget the cached sector, so the next access reads it from the disk.
+    pub fn invalidate(&mut self) {
+        self.block_idx = None;
     }
 
     /// Access a blank sector

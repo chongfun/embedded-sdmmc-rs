@@ -37,6 +37,15 @@ pub(crate) fn validate_long_filename(name: &str) -> Result<usize, FilenameError>
             '\u{0000}'..='\u{001F}' | '"' | '*' | '/' | ':' | '<' | '>' | '?' | '\\' | '|' => {
                 return Err(FilenameError::InvalidCharacter);
             }
+            // 0xFFFF is what pads out the unused half of a long-name entry,
+            // so a name cannot also use it as a character. A name is only
+            // followed by a NUL and padding when it does not fill its entries
+            // exactly; one that ends on a 13-code-unit boundary has neither,
+            // and a trailing U+FFFF there would be indistinguishable from the
+            // padding of a shorter name.
+            '\u{FFFF}' => {
+                return Err(FilenameError::InvalidCharacter);
+            }
             _ => {}
         }
         utf16_len += ch.len_utf16();

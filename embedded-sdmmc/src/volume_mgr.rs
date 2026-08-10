@@ -580,7 +580,7 @@ where
                 // we are opening an existing file
                 Some(entry)
             }
-            Err(_)
+            Err(Error::NotFound)
                 if (mode == Mode::ReadWriteCreate)
                     | (mode == Mode::ReadWriteCreateOrTruncate)
                     | (mode == Mode::ReadWriteCreateOrAppend) =>
@@ -589,10 +589,16 @@ where
                 // asked us to create it
                 None
             }
-            _ => {
+            Err(Error::NotFound) => {
                 // We are opening a non-existant file, and that's not OK.
                 return Err(Error::NotFound);
             }
+            // A lookup that failed for any other reason did not establish
+            // that the file is missing. Reporting it as NotFound would tell
+            // a caller that the name is free -- and in the create modes
+            // above, would go on to create a second entry for a name that
+            // may well already exist.
+            Err(error) => return Err(error),
         };
 
         // Check if it's open already
@@ -619,6 +625,7 @@ where
                         cluster,
                         sfn,
                         att,
+                        ClusterId::EMPTY,
                     )?,
                 };
 
@@ -771,18 +778,16 @@ where
                 // we are opening an existing file
                 entry
             }
-            Err(_)
-                if (mode == Mode::ReadWriteCreate)
-                    | (mode == Mode::ReadWriteCreateOrTruncate)
-                    | (mode == Mode::ReadWriteCreateOrAppend) =>
-            {
-                // We are opening a non-existant file and we cannot do that with LFNs
+            Err(Error::NotFound) => {
+                // Either the file is not there and we were asked to open it,
+                // or it is not there and we were asked to create it -- which
+                // this call cannot do with a long name. Both are NotFound.
                 return Err(Error::NotFound);
             }
-            _ => {
-                // We are opening a non-existant file, and that's not OK.
-                return Err(Error::NotFound);
-            }
+            // A lookup that failed for any other reason did not establish that
+            // the file is missing, and saying it did would tell the caller
+            // something about the volume that was never read.
+            Err(error) => return Err(error),
         };
 
         // Check if it's open already
@@ -874,20 +879,79 @@ where
         }
     }
 
-    /// Create a file with a VFAT long name and a caller-supplied unique 8.3 alias.
+    /// Create a directory with a VFAT long name.
     ///
-    /// Existing files continue to be opened through their short alias. This
-    /// operation only creates a new file and returns [`Error::FileAlreadyExists`]
-    /// if the alias is already present.
-    pub fn create_file_in_dir_lfn<N>(
+    /// The folder is named the way a file is: the name the caller gives is
+    /// kept as-is, and the 8.3 alias every FAT entry needs is derived from it
+    /// and made unique within this directory. The alias is never the name --
+    /// see [`Self::create_file_in_dir_lfn`].
+    ///
+    /// Fails with [`Error::DirAlreadyExists`] or [`Error::FileAlreadyExists`]
+    /// if the name is taken, compared the same way as for a file.
+    pub fn make_dir_in_dir_lfn(
         &self,
         directory: RawDirectory,
         long_name: &str,
-        short_alias: N,
-    ) -> Result<RawFile, Error<D::Error>>
-    where
-        N: ToShortFileName,
-    {
+    ) -> Result<(), Error<D::Error>> {
+        let mut data = self.data.try_borrow_mut().map_err(|_| Error::LockError)?;
+        let data = data.deref_mut();
+
+        let directory_idx = data.get_dir_by_id(directory)?;
+        let volume_id = data.open_dirs[directory_idx].raw_volume;
+        let volume_idx = data.get_volume_by_id(volume_id)?;
+
+        data.check_name_is_free(volume_idx, directory_idx, long_name)?;
+
+        let sfn = match &data.open_volumes[volume_idx].volume_type {
+            VolumeType::Fat(fat) => fat.generate_short_alias(
+                &mut data.block_cache,
+                &data.open_dirs[directory_idx],
+                long_name,
+            )?,
+        };
+
+        let cluster = data.open_dirs[directory_idx].cluster;
+        let att = Attributes::create_from_fat(Attributes::DIRECTORY);
+        match &mut data.open_volumes[volume_idx].volume_type {
+            VolumeType::Fat(fat) => fat.make_dir(
+                &mut data.block_cache,
+                &self.time_source,
+                cluster,
+                sfn,
+                Some(long_name),
+                att,
+            )?,
+        };
+        Ok(())
+    }
+
+    /// Create a file with a VFAT long name.
+    ///
+    /// The file is created under the name given, kept as written. Every FAT
+    /// entry also needs an 8.3 short name, and that alias is derived here
+    /// rather than asked for: it has to be unique within the directory, and
+    /// the directory is the only thing that can decide that. It is an artefact
+    /// of the format, not part of the name -- callers should not show it to
+    /// anyone or store it as identity, since the same long name in a different
+    /// directory may well get a different one.
+    ///
+    /// This only creates; it returns [`Error::FileAlreadyExists`] if the name
+    /// is already present. A directory has one namespace spanning every
+    /// entry's long name and short name together, so an existing entry's alias
+    /// can be what the new name collides with.
+    ///
+    /// Names are compared with case ignored, by lowercasing: ASCII and the
+    /// accented Latin, Greek and Cyrillic pairs all collide as they should.
+    /// This is case mapping rather than full Unicode case folding, so a
+    /// handful of characters that fold together without lowercasing alike --
+    /// Greek final sigma being the usual example -- are still treated as
+    /// different names. Nor is anything normalised: a composed and a
+    /// decomposed spelling of the same word are different names.
+    pub fn create_file_in_dir_lfn(
+        &self,
+        directory: RawDirectory,
+        long_name: &str,
+    ) -> Result<RawFile, Error<D::Error>> {
         let mut data = self.data.try_borrow_mut().map_err(|_| Error::LockError)?;
         let data = data.deref_mut();
 
@@ -898,21 +962,16 @@ where
         let directory_idx = data.get_dir_by_id(directory)?;
         let volume_id = data.open_dirs[directory_idx].raw_volume;
         let volume_idx = data.get_volume_by_id(volume_id)?;
-        let short_alias = short_alias
-            .to_short_filename()
-            .map_err(Error::FilenameError)?;
-
-        match &data.open_volumes[volume_idx].volume_type {
-            VolumeType::Fat(fat) => match fat.find_directory_entry(
+        // The name has to be free before an alias is derived from it, so a
+        // rejected name costs one scan rather than a scan per candidate.
+        data.check_name_is_free(volume_idx, directory_idx, long_name)?;
+        let short_alias = match &data.open_volumes[volume_idx].volume_type {
+            VolumeType::Fat(fat) => fat.generate_short_alias(
                 &mut data.block_cache,
                 &data.open_dirs[directory_idx],
-                &short_alias,
-            ) {
-                Ok(_) => return Err(Error::FileAlreadyExists),
-                Err(Error::NotFound) => {}
-                Err(error) => return Err(error),
-            },
-        }
+                long_name,
+            )?,
+        };
 
         let cluster = data.open_dirs[directory_idx].cluster;
         let attributes = Attributes::create_from_fat(0);
@@ -941,6 +1000,197 @@ where
             data.open_files.push_unchecked(file);
         }
         Ok(file_id)
+    }
+
+    /// Move a file to another name, in this or another directory on the same
+    /// volume.
+    ///
+    /// Nothing is read or copied and no clusters are allocated: the file keeps
+    /// the chain it already has, and only the directory entries naming it
+    /// change. Moving a book across a card costs two directory writes rather
+    /// than its own length in reads and writes.
+    ///
+    /// Those two writes cannot be made one, so a crash between them leaves the
+    /// chain with both names. That is the only way to observe it -- this call
+    /// owns both halves, so no caller ever holds a handle while it is true.
+    /// Recovery is to unlink the name you do not want with
+    /// [`Self::delete_entry_in_dir`], which takes the name away and leaves the
+    /// chain alone. Do not open it and truncate it: that frees clusters the
+    /// surviving name still points at. A caller that needs to know which name
+    /// it meant to keep has to record that intent durably before starting.
+    ///
+    /// If the destination is written but the source cannot be unlinked, the
+    /// destination is unlinked again so the move looks as though it never
+    /// happened, and the original error is returned. Should that second
+    /// unlink fail too, both names are left in place and the error is still
+    /// returned -- the same state a crash leaves, recovered the same way.
+    ///
+    /// Fails with:
+    ///
+    /// - [`Error::NotFound`] if `source_name` is not in `source_directory`.
+    /// - [`Error::FileAlreadyOpen`] if the source is open. Its directory entry
+    ///   is only brought up to date on flush or close, so moving it would
+    ///   carry a length and start cluster the file has already moved past.
+    /// - [`Error::OpenedDirAsFile`] if the source is a directory. A directory
+    ///   carries a `..` entry naming its parent, which this call does not
+    ///   update. Moving directories needs an operation that maintains `..`
+    ///   and refuses to move one into its own descendants.
+    /// - [`Error::Unsupported`] if the two directories are on different
+    ///   volumes. A cluster number only means anything against its own FAT,
+    ///   so that has to be a copy, not a move.
+    /// - [`Error::FileAlreadyExists`] if `long_name` is taken in the
+    ///   destination, compared as described on
+    ///   [`Self::create_file_in_dir_lfn`].
+    pub fn move_file_in_dir_lfn<N>(
+        &self,
+        source_directory: RawDirectory,
+        source_name: N,
+        dest_directory: RawDirectory,
+        long_name: &str,
+    ) -> Result<(), Error<D::Error>>
+    where
+        N: ToShortFileName,
+    {
+        // Resolved once: it is needed twice, and `ShortFileName` is `Copy`
+        // where the caller's type need not be.
+        let source_name = source_name.to_short_filename().map_err(Error::FilenameError)?;
+
+        let short_alias =
+            self.link_file_in_dir_lfn(source_directory, source_name, dest_directory, long_name)?;
+
+        match self.delete_entry_in_dir(source_directory, source_name) {
+            Ok(()) => Ok(()),
+            Err(error) => {
+                // Put the destination back, so a move that failed is a move
+                // that did not happen rather than one the caller is left to
+                // finish. If this fails too, both names remain and the caller
+                // is where a crash would have put them -- which the returned
+                // error, and the documented recovery, already cover.
+                let _ = self.delete_entry_in_dir(dest_directory, short_alias);
+                Err(error)
+            }
+        }
+    }
+
+    /// Give an existing file a second name, in this or another directory on
+    /// the same volume.
+    ///
+    /// Writes a long-named directory entry in `dest_directory` pointing at the
+    /// cluster chain, size, attributes and timestamps that `source_name`
+    /// already has in `source_directory`. No file data is read or copied, and
+    /// no clusters are allocated.
+    ///
+    /// This is half of a move, and it is deliberately not public. While both
+    /// names exist they are two entries holding their own copies of the start
+    /// cluster and the length, and nothing keeps those copies in step: writing
+    /// or truncating through one name updates that entry alone, leaving the
+    /// other describing a file that is no longer there. FAT has no way to
+    /// share that metadata, so the state is only safe as long as nobody
+    /// mutates through either name -- which is a rule callers cannot be given
+    /// and expected to keep.
+    ///
+    /// [`VolumeManager::move_file_in_dir_lfn`] therefore owns both halves and
+    /// never hands the intermediate state to a caller. It can still be *found*
+    /// on disk after a crash between the two writes; recovery is to unlink the
+    /// unwanted name with [`Self::delete_entry_in_dir`], which takes a name
+    /// away without freeing the chain behind it. Never delete-and-reclaim it,
+    /// because reclaiming frees clusters the surviving name still points at.
+    ///
+    /// The source is named rather than passed as a [`DirEntry`] so that this
+    /// call can establish three things a bare entry cannot. The entry is read
+    /// here, under the same borrow that writes the new name, so it cannot be
+    /// a snapshot taken before a write that has not reached the disk yet. It
+    /// arrives with the volume it came from, so a source on another volume can
+    /// be refused rather than having its cluster number reinterpreted against
+    /// the wrong FAT. And it can be checked against the open-file table.
+    ///
+    /// Fails with:
+    ///
+    /// - [`Error::NotFound`] if `source_name` is not in `source_directory`.
+    /// - [`Error::FileAlreadyOpen`] if the source is open. Its directory entry
+    ///   is only brought up to date on flush or close, so linking it here
+    ///   would copy a length and start cluster that the file has already moved
+    ///   past, and unlinking the original afterwards would strand the data.
+    /// - [`Error::OpenedDirAsFile`] if the source is a directory. A directory
+    ///   carries a `..` entry naming its parent, which this call does not
+    ///   update, so linking one elsewhere would leave that back-pointer aimed
+    ///   at the old parent. Moving directories needs an operation that
+    ///   maintains `..` and rejects moves into their own descendants.
+    /// - [`Error::Unsupported`] if the two directories are on different
+    ///   volumes. A cluster number only means anything against its own FAT, so
+    ///   this has to be a copy, not a link.
+    /// - [`Error::FileAlreadyExists`] if `long_name` is taken in the
+    ///   destination, compared as described on
+    ///   [`Self::create_file_in_dir_lfn`]. The destination's 8.3 alias is
+    ///   derived there too, so it cannot collide.
+    pub(crate) fn link_file_in_dir_lfn<N>(
+        &self,
+        source_directory: RawDirectory,
+        source_name: N,
+        dest_directory: RawDirectory,
+        long_name: &str,
+    ) -> Result<ShortFileName, Error<D::Error>>
+    where
+        N: ToShortFileName,
+    {
+        let mut data = self.data.try_borrow_mut().map_err(|_| Error::LockError)?;
+        let data = data.deref_mut();
+
+        let source_dir_idx = data.get_dir_by_id(source_directory)?;
+        let source_volume_id = data.open_dirs[source_dir_idx].raw_volume;
+        let dest_dir_idx = data.get_dir_by_id(dest_directory)?;
+        let dest_volume_id = data.open_dirs[dest_dir_idx].raw_volume;
+
+        // A cluster number is only meaningful against the FAT it was allocated
+        // from. Linking across volumes would point the new name at whatever
+        // happens to live at that number on the destination, and a later
+        // truncate or delete would then edit a chain nobody meant to touch.
+        if source_volume_id != dest_volume_id {
+            return Err(Error::Unsupported);
+        }
+        let volume_idx = data.get_volume_by_id(dest_volume_id)?;
+
+        let source_sfn = source_name.to_short_filename().map_err(Error::FilenameError)?;
+
+        // Read the source entry now, rather than trusting one the caller
+        // captured earlier: this is what makes the checks below meaningful.
+        let source = match &data.open_volumes[volume_idx].volume_type {
+            VolumeType::Fat(fat) => fat.find_directory_entry(
+                &mut data.block_cache,
+                &data.open_dirs[source_dir_idx],
+                &source_sfn,
+            )?,
+        };
+
+        if source.attributes.is_directory() {
+            return Err(Error::OpenedDirAsFile);
+        }
+
+        if data.file_is_open(source_volume_id, &source) {
+            return Err(Error::FileAlreadyOpen);
+        }
+
+        data.check_name_is_free(volume_idx, dest_dir_idx, long_name)?;
+        let short_alias = match &data.open_volumes[volume_idx].volume_type {
+            VolumeType::Fat(fat) => fat.generate_short_alias(
+                &mut data.block_cache,
+                &data.open_dirs[dest_dir_idx],
+                long_name,
+            )?,
+        };
+
+        let cluster = data.open_dirs[dest_dir_idx].cluster;
+        match &mut data.open_volumes[volume_idx].volume_type {
+            VolumeType::Fat(fat) => fat.write_linked_directory_entry_lfn(
+                &mut data.block_cache,
+                cluster,
+                long_name,
+                short_alias,
+                &source,
+            )?,
+        };
+        // Handed back so a move can undo itself without deriving it again.
+        Ok(short_alias)
     }
 
     /// Delete a closed file or empty directory with the given filename, if it exists.
@@ -1194,15 +1444,20 @@ where
                     debug!("Extending file");
                     match data.open_volumes[volume_idx].volume_type {
                         VolumeType::Fat(ref mut fat) => {
-                            if fat
-                                .alloc_cluster(
-                                    &mut data.block_cache,
-                                    Some(current_cluster.1),
-                                    false,
-                                )
-                                .is_err()
-                            {
-                                return Err(Error::DiskFull);
+                            // Only actually running out of clusters is a full
+                            // disk. A FAT or device error on the way to that
+                            // answer says nothing about free space, and a
+                            // caller told "full" reasonably starts deleting
+                            // things to make room.
+                            if let Err(error) = fat.alloc_cluster(
+                                &mut data.block_cache,
+                                Some(current_cluster.1),
+                                false,
+                            ) {
+                                return Err(match error {
+                                    Error::NotEnoughSpace => Error::DiskFull,
+                                    error => error,
+                                });
                             }
                             debug!("Allocated new FAT cluster, finding offsets...");
                             let new_offset = data
@@ -1212,7 +1467,10 @@ where
                                     data.open_files[file_idx].entry.cluster,
                                     data.open_files[file_idx].current_offset,
                                 )
-                                .map_err(|_| Error::AllocationError)?;
+                                .map_err(|error| match error {
+                                    Error::NotEnoughSpace => Error::AllocationError,
+                                    error => error,
+                                })?;
                             debug!("New offset {:?}", new_offset);
                             new_offset
                         }
@@ -1459,6 +1717,7 @@ where
                     &self.time_source,
                     parent_directory_info.cluster,
                     sfn,
+                    None,
                     att,
                 )?;
             }
@@ -1497,12 +1756,50 @@ where
     /// Check if a file is open
     ///
     /// Returns `true` if it's open, `false`, otherwise.
+    /// Refuse a name that something in the directory already answers to.
+    fn check_name_is_free(
+        &mut self,
+        volume_idx: usize,
+        directory_idx: usize,
+        name: &str,
+    ) -> Result<(), Error<D::Error>> {
+        match &self.open_volumes[volume_idx].volume_type {
+            VolumeType::Fat(fat) => {
+                if fat.name_is_taken(
+                    &mut self.block_cache,
+                    &self.open_dirs[directory_idx],
+                    name,
+                )? {
+                    return Err(Error::FileAlreadyExists);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Is this entry, or the file behind it, already open?
+    ///
+    /// Two things count. The obvious one is the same directory entry. The
+    /// other is a different entry naming the same cluster chain, which
+    /// `link_file_in_dir_lfn` deliberately creates: the two entries are
+    /// different names for one file, and the open-file rules exist to protect
+    /// the file, not the name. Letting both be open at once would allow one
+    /// handle to truncate the chain -- freeing its clusters and recording the
+    /// new length against its own entry only -- while the other went on
+    /// writing to clusters that had been handed back to the volume.
+    ///
+    /// A chain of `EMPTY` is not a chain: every zero-length file has one, and
+    /// they are genuinely unrelated.
     fn file_is_open(&self, raw_volume: RawVolume, dir_entry: &DirEntry) -> bool {
         for f in self.open_files.iter() {
-            if f.raw_volume == raw_volume
-                && f.entry.entry_block == dir_entry.entry_block
-                && f.entry.entry_offset == dir_entry.entry_offset
-            {
+            if f.raw_volume != raw_volume {
+                continue;
+            }
+            let same_entry = f.entry.entry_block == dir_entry.entry_block
+                && f.entry.entry_offset == dir_entry.entry_offset;
+            let same_chain =
+                dir_entry.cluster != ClusterId::EMPTY && f.entry.cluster == dir_entry.cluster;
+            if same_entry || same_chain {
                 return true;
             }
         }

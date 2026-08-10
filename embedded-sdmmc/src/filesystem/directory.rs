@@ -220,24 +220,62 @@ where
     }
 
     /// Create a file with a VFAT long name and a caller-supplied unique 8.3 alias.
-    pub fn create_file_in_dir_lfn<N>(
+    pub fn create_file_in_dir_lfn(
         &self,
         long_name: &str,
-        short_alias: N,
     ) -> Result<crate::File<'a, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>, crate::Error<D::Error>>
-    where
-        N: super::ToShortFileName,
     {
-        let file =
-            self.volume_mgr
-                .create_file_in_dir_lfn(self.raw_directory, long_name, short_alias)?;
+        let file = self
+            .volume_mgr
+            .create_file_in_dir_lfn(self.raw_directory, long_name)?;
         Ok(file.to_file(self.volume_mgr))
+    }
+
+    /// Create a directory with a VFAT long name.
+    ///
+    /// See [`VolumeManager::make_dir_in_dir_lfn`] for details, except the
+    /// directory given is this directory.
+    pub fn make_dir_in_dir_lfn(&self, long_name: &str) -> Result<(), Error<D::Error>> {
+        self.volume_mgr
+            .make_dir_in_dir_lfn(self.raw_directory, long_name)
+    }
+
+    /// Move `source_name` out of this directory to a new name, in this
+    /// directory or another one on the same volume.
+    ///
+    /// See [`VolumeManager::move_file_in_dir_lfn`] for what this costs, what
+    /// a crash between its two writes leaves behind, and the cases it refuses.
+    pub fn move_file_in_dir_lfn<N>(
+        &self,
+        source_name: N,
+        dest_directory: &Self,
+        long_name: &str,
+    ) -> Result<(), Error<D::Error>>
+    where
+        N: ToShortFileName,
+    {
+        // See the note in `VolumeManager::link_file_in_dir_lfn`: handles are
+        // numbers, and two managers hand out the same ones.
+        if !core::ptr::eq(self.volume_mgr, dest_directory.volume_mgr) {
+            return Err(Error::BadHandle);
+        }
+        self.volume_mgr.move_file_in_dir_lfn(
+            self.raw_directory,
+            source_name,
+            dest_directory.raw_directory,
+            long_name,
+        )
     }
 
     /// Delete a file/directory.
     ///
     /// See [`VolumeManager::delete_entry_in_dir`] for details, except the
     /// directory given is this directory.
+    ///
+    /// This removes the directory entry -- including its long-name chain --
+    /// and does *not* free the file's clusters. For an ordinary delete that
+    /// is a leak unless the caller truncates first; for the second half of a
+    /// move it is exactly right, since the chain still has another name.
     pub fn delete_entry_in_dir<N>(&self, name: N) -> Result<(), Error<D::Error>>
     where
         N: ToShortFileName,

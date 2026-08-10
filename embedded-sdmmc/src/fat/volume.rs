@@ -7,7 +7,7 @@ use byteorder::{ByteOrder, LittleEndian};
 
 use crate::{
     Attributes, Block, BlockCache, BlockCount, BlockDevice, BlockIdx, ClusterId, DirEntry,
-    DirectoryInfo, Error, LfnBuffer, ShortFileName, TimeSource, VolumeType, debug,
+    DirectoryInfo, Error, LfnBuffer, ShortFileName, TimeSource, Timestamp, VolumeType, debug,
     fat::{
         Bpb, Fat16Info, Fat32Info, FatSpecificInfo, FatType, InfoSector, OnDiskDirEntry,
         RESERVED_ENTRIES,
@@ -32,6 +32,196 @@ struct PendingLfnSlots {
     checksum: u8,
     next_sequence: u8,
     active: bool,
+}
+
+/// Map one character of a long name into what an 8.3 alias can hold.
+///
+/// The result is always ASCII. A short name is eleven raw bytes with no
+/// encoding attached, so anything outside ASCII would be guesswork -- and one
+/// byte in particular, `0xE5`, means "this entry is deleted", which a name
+/// beginning with `å` would otherwise produce. Nothing is lost by flattening:
+/// the long name keeps the user's spelling, and the alias exists only so the
+/// entry has a short name at all.
+fn basis_byte(c: char) -> u8 {
+    match c {
+        c if c.is_ascii_lowercase() => c.to_ascii_uppercase() as u8,
+        '\u{0000}'..='\u{001F}' | '"' | '*' | '+' | ',' | '/' | ':' | ';' | '<' | '=' | '>'
+        | '?' | '[' | '\\' | ']' | '|' => b'_',
+        c if !c.is_ascii() => b'_',
+        c => c as u8,
+    }
+}
+
+/// Split a long name into the stem and extension an alias is built from.
+///
+/// Spaces and interior dots go: FAT allows neither, and dropping them is what
+/// makes `A Real Book.epub` read as `AREALBO` rather than `A_REAL_`.
+fn short_name_basis(long_name: &str) -> (Vec<u8, 8>, Vec<u8, 3>) {
+    let (stem, ext) = match long_name.rfind('.') {
+        Some(i) if i > 0 => (&long_name[..i], &long_name[i + 1..]),
+        _ => (long_name, ""),
+    };
+    let mut base = Vec::<u8, 8>::new();
+    for c in stem.chars().filter(|c| *c != '.' && *c != ' ') {
+        if base.push(basis_byte(c)).is_err() {
+            break;
+        }
+    }
+    if base.is_empty() {
+        let _ = base.push(b'_');
+    }
+    let mut extension = Vec::<u8, 3>::new();
+    for c in ext.chars().filter(|c| *c != '.' && *c != ' ') {
+        if extension.push(basis_byte(c)).is_err() {
+            break;
+        }
+    }
+    (base, extension)
+}
+
+/// A 16-bit digest of the long name, used to spread aliases out once the
+/// readable `~N` forms are gone. Only determinism matters here.
+fn long_name_digest(long_name: &str) -> u16 {
+    let mut hash: u16 = 0x1505;
+    for b in long_name.as_bytes() {
+        hash = hash.rotate_left(5) ^ u16::from(*b);
+    }
+    hash
+}
+
+/// Assemble `BASE.EXT` from parts that are already ASCII.
+///
+/// Eight characters of base, a dot and three of extension is twelve, which is
+/// the buffer, so nothing here can overflow.
+fn assemble_alias(base: &[u8], ext: &[u8]) -> heapless::String<12> {
+    let mut out = heapless::String::<12>::new();
+    for &b in base.iter().take(8) {
+        let _ = out.push(b as char);
+    }
+    if !ext.is_empty() {
+        let _ = out.push('.');
+        for &b in ext.iter().take(3) {
+            let _ = out.push(b as char);
+        }
+    }
+    out
+}
+
+/// `BASE~N`, with the base shortened to leave room for the tail.
+fn compose_alias(base: &[u8], ext: &[u8], tail: u32) -> heapless::String<12> {
+    use core::fmt::Write;
+    let mut suffix = heapless::String::<8>::new();
+    let _ = write!(suffix, "~{tail}");
+    let keep = 8usize.saturating_sub(suffix.len()).max(1);
+
+    let mut stem = Vec::<u8, 8>::new();
+    for &b in base.iter().take(keep) {
+        let _ = stem.push(b);
+    }
+    for b in suffix.bytes() {
+        let _ = stem.push(b);
+    }
+    assemble_alias(&stem, ext)
+}
+
+/// `BBHHHH~1`: two characters of base, four hex digits of digest, and a tail.
+///
+/// Once the readable forms are taken this is what the search moves to. It
+/// gives 65536 candidates for one directory rather than the 999 a decimal tail
+/// allows, which matters for a library that expects to hold thousands of books
+/// whose names may share an opening.
+fn compose_hashed_alias(base: &[u8], ext: &[u8], digest: u16) -> heapless::String<12> {
+    use core::fmt::Write;
+    let mut stem = Vec::<u8, 8>::new();
+    for &b in base.iter().take(2) {
+        let _ = stem.push(b);
+    }
+    let mut hex = heapless::String::<8>::new();
+    let _ = write!(hex, "{digest:04X}~1");
+    for b in hex.bytes() {
+        let _ = stem.push(b);
+    }
+    assemble_alias(&stem, ext)
+}
+
+/// Match a long-name entry's code units off the end of `remaining`.
+///
+/// `words` must arrive in reverse order, because a long name is compared from
+/// its end: the entries come off the disk last-chunk-first, and within a chunk
+/// the last code unit is the one furthest along the name.
+///
+/// Anything above U+FFFF is stored as a high/low surrogate pair, so walking
+/// backwards we meet the low half first and have to hold it until its high
+/// half turns up. That may not happen until the next entry -- 13 code units
+/// per entry does not respect character boundaries -- which is why the pending
+/// half is owned by the caller and lives across calls.
+/// Take `c` off the end of `s`, optionally ignoring ASCII case.
+fn strip_last_char(s: &str, c: char, fold_case: bool) -> Option<&str> {
+    let last = s.chars().next_back()?;
+    let same = if fold_case {
+        // Simple case *mapping*, not Unicode case folding: two scalars are the
+        // same name if lowercasing them agrees. That covers the accented
+        // Latin, Greek and Cyrillic pairs an ASCII fold misses, and costs a
+        // table already in core rather than a dependency.
+        //
+        // It is not the whole of Unicode. Characters that fold together
+        // without lowercasing to the same scalar still compare as different --
+        // Greek final sigma is the standard example, since lowercase sigma and
+        // final sigma are both already lowercase. Closing that needs real
+        // case-folding tables, which is a bigger thing than this crate should
+        // carry; what is documented is what is done.
+        last == c || last.to_lowercase().eq(c.to_lowercase())
+    } else {
+        last == c
+    };
+    same.then(|| &s[..s.len() - last.len_utf8()])
+}
+
+/// With `fold_case`, ASCII letters compare equal regardless of case. FAT
+/// treats a directory's long and short names as one namespace in which case
+/// differences are collisions rather than distinctions, so creating a name
+/// needs that comparison even though looking one up does not.
+///
+/// Returns `false` if this is not the name we are looking for.
+fn strip_lfn_words(
+    words: impl Iterator<Item = u16>,
+    remaining: &mut &str,
+    pending_low: &mut Option<u16>,
+    fold_case: bool,
+) -> bool {
+    for word in words {
+        let c = if (0xDC00..=0xDFFF).contains(&word) {
+            // Low half. Its high half is the next word we will see.
+            *pending_low = Some(word);
+            continue;
+        } else if (0xD800..=0xDBFF).contains(&word) {
+            let Some(low) = pending_low.take() else {
+                // A high half with nothing to pair it with: not a name we can
+                // have written.
+                return false;
+            };
+            let code_point = 0x1_0000u32
+                + (((u32::from(word) - 0xD800) << 10) | (u32::from(low) - 0xDC00));
+            match char::from_u32(code_point) {
+                Some(c) => c,
+                None => return false,
+            }
+        } else {
+            if pending_low.is_some() {
+                // A low half followed by something that cannot complete it.
+                return false;
+            }
+            match char::from_u32(u32::from(word)) {
+                Some(c) => c,
+                None => return false,
+            }
+        };
+        let Some(r) = strip_last_char(remaining, c, fold_case) else {
+            return false;
+        };
+        *remaining = r;
+    }
+    true
 }
 
 impl PendingLfnSlots {
@@ -246,6 +436,24 @@ where
     block_cache.write_back().map_err(Error::DeviceError)
 }
 
+/// Retire a directory entry by marking each of its slots deleted.
+///
+/// `slots` arrives as it sits on the disk: the long-name entries first, then
+/// the short entry they belong to. They are marked in the opposite order,
+/// because these are separate sector writes and any of them can fail.
+///
+/// The short entry is what makes the file exist. Marking it first makes it the
+/// commit point: fail before it and nothing has changed, so the entry is
+/// wholly intact; fail after it and the file is wholly gone, which is what the
+/// caller asked for. Marking the long-name entries first would instead put the
+/// failure in the middle -- a live file whose long name had been partly erased,
+/// findable by neither name it used to answer to.
+///
+/// A failure after the commit point leaves long-name entries with no short
+/// entry behind them. Readers already skip those, so nothing is misread; they
+/// are wasted directory slots until something reclaims them. That is the
+/// lesser of the two failures, and the reason the delete still reports success:
+/// the name the caller asked to remove is gone.
 fn mark_directory_slots_deleted<D>(
     block_cache: &mut BlockCache<D>,
     slots: &[DirectorySlot],
@@ -253,7 +461,30 @@ fn mark_directory_slots_deleted<D>(
 where
     D: BlockDevice,
 {
-    for slot in slots {
+    let Some((short_slot, lfn_slots)) = slots.split_last() else {
+        return Ok(());
+    };
+
+    // The commit point. Its failure is the caller's failure.
+    mark_one_slot_deleted(block_cache, short_slot)?;
+
+    // Past here the entry is gone whatever happens; what is left is tidying.
+    for slot in lfn_slots {
+        if mark_one_slot_deleted(block_cache, slot).is_err() {
+            break;
+        }
+    }
+    Ok(())
+}
+
+fn mark_one_slot_deleted<D>(
+    block_cache: &mut BlockCache<D>,
+    slot: &DirectorySlot,
+) -> Result<(), Error<D::Error>>
+where
+    D: BlockDevice,
+{
+    {
         let block = block_cache
             .read_mut(slot.block)
             .map_err(Error::DeviceError)?;
@@ -522,6 +753,7 @@ impl FatVolume {
         dir_cluster: ClusterId,
         name: ShortFileName,
         attributes: Attributes,
+        first_cluster: ClusterId,
     ) -> Result<DirEntry, Error<D::Error>>
     where
         D: BlockDevice,
@@ -564,7 +796,7 @@ impl FatVolume {
                                 let entry = DirEntry::new(
                                     name,
                                     attributes,
-                                    ClusterId::EMPTY,
+                                    first_cluster,
                                     ctime,
                                     block_idx,
                                     (i * OnDiskDirEntry::LEN) as u32,
@@ -588,7 +820,11 @@ impl FatVolume {
                                 first_dir_block_num = self.cluster_to_block(c);
                                 Some(c)
                             }
-                            _ => None,
+                            // Running out of chain is what "the disk is full"
+                            // means here. A chain we could not read says
+                            // nothing about free space, and must not be
+                            // reported as though it did.
+                            Err(error) => return Err(error),
                         };
                     } else {
                         current_cluster = None;
@@ -627,7 +863,7 @@ impl FatVolume {
                                 let entry = DirEntry::new(
                                     name,
                                     attributes,
-                                    ClusterId(0),
+                                    first_cluster,
                                     ctime,
                                     block_idx,
                                     (i * OnDiskDirEntry::LEN) as u32,
@@ -652,7 +888,7 @@ impl FatVolume {
                             first_dir_block_num = self.cluster_to_block(c);
                             Some(c)
                         }
-                        _ => None,
+                        Err(error) => return Err(error),
                     };
                 }
                 // We ran out of clusters in the chain, and apparently we weren't
@@ -678,6 +914,70 @@ impl FatVolume {
     where
         D: BlockDevice,
         T: TimeSource,
+    {
+        let ctime = time_source.get_timestamp();
+        self.write_directory_entry_lfn(
+            block_cache,
+            dir_cluster,
+            long_name,
+            short_name,
+            attributes,
+            ClusterId::EMPTY,
+            0,
+            ctime,
+            ctime,
+        )
+    }
+
+    /// Write a long-named directory entry describing a cluster chain that
+    /// already exists.
+    ///
+    /// This is half of a same-volume move: it gives an existing chain a second
+    /// name, and [`Self::delete_directory_entry`] then takes the first one
+    /// away without touching the chain itself. Between those two writes the
+    /// chain has two names, and a caller that crashes there must unlink one of
+    /// them rather than delete it -- deleting reclaims clusters that both
+    /// names still point at.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn write_linked_directory_entry_lfn<D>(
+        &mut self,
+        block_cache: &mut BlockCache<D>,
+        dir_cluster: ClusterId,
+        long_name: &str,
+        short_name: ShortFileName,
+        source: &DirEntry,
+    ) -> Result<DirEntry, Error<D::Error>>
+    where
+        D: BlockDevice,
+    {
+        self.write_directory_entry_lfn(
+            block_cache,
+            dir_cluster,
+            long_name,
+            short_name,
+            source.attributes,
+            source.cluster,
+            source.size,
+            source.ctime,
+            source.mtime,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn write_directory_entry_lfn<D>(
+        &mut self,
+        block_cache: &mut BlockCache<D>,
+        dir_cluster: ClusterId,
+        long_name: &str,
+        short_name: ShortFileName,
+        attributes: Attributes,
+        cluster: ClusterId,
+        size: u32,
+        ctime: Timestamp,
+        mtime: Timestamp,
+    ) -> Result<DirEntry, Error<D::Error>>
+    where
+        D: BlockDevice,
     {
         let utf16_len = validate_long_filename(long_name).map_err(Error::FilenameError)?;
         let lfn_count = utf16_len.div_ceil(LFN_CHARS_PER_ENTRY);
@@ -708,16 +1008,17 @@ impl FatVolume {
             written += 1;
         }
 
-        let ctime = time_source.get_timestamp();
         let short_slot = slots[lfn_count];
-        let entry = DirEntry::new(
+        let mut entry = DirEntry::new(
             short_name,
             attributes,
-            ClusterId::EMPTY,
+            cluster,
             ctime,
             short_slot.block,
             short_slot.offset,
         );
+        entry.mtime = mtime;
+        entry.size = size;
         let raw = entry.serialize(self.get_fat_type());
         if let Err(error) = write_directory_slot(block_cache, short_slot, &raw) {
             let _ = mark_directory_slots_deleted(block_cache, &slots[..written]);
@@ -889,7 +1190,13 @@ impl FatVolume {
                         lfn_buffer.push(&buffer);
                         SeqState::Complete { csum }
                     }
-                    (true, sequence, _) if (0x02..0x14).contains(&sequence) => {
+                    // The first entry of a chain carries the highest sequence
+                    // number, so this bound is what limits how long a name can
+                    // be listed -- it has to reach whatever creation is willing
+                    // to write.
+                    (true, sequence, _)
+                        if (0x02..=MAX_LFN_ENTRIES as u8).contains(&sequence) =>
+                    {
                         lfn_buffer.clear();
                         lfn_buffer.push(&buffer);
                         SeqState::Remaining {
@@ -902,7 +1209,8 @@ impl FatVolume {
                         SeqState::Complete { csum }
                     }
                     (false, sequence, SeqState::Remaining { csum, next })
-                        if (0x01..0x13).contains(&sequence) && next == sequence =>
+                        if (0x01..MAX_LFN_ENTRIES as u8).contains(&sequence)
+                            && next == sequence =>
                     {
                         lfn_buffer.push(&buffer);
                         SeqState::Remaining {
@@ -994,7 +1302,12 @@ impl FatVolume {
                         first_dir_block_num = self.cluster_to_block(n);
                         Some(n)
                     }
-                    _ => None,
+                    // The chain ending is what "no more entries" means; a
+                    // chain we could not follow is not the same answer, and
+                    // callers that treat NotFound as proof of absence need
+                    // to be able to tell those apart.
+                    Err(Error::EndOfFile) => None,
+                    Err(error) => return Err(error),
                 };
             } else {
                 current_cluster = None;
@@ -1044,7 +1357,11 @@ impl FatVolume {
                     }
                 }
             }
-            current_cluster = self.next_cluster(block_cache, cluster).ok();
+            current_cluster = match self.next_cluster(block_cache, cluster) {
+                Ok(n) => Some(n),
+                Err(Error::EndOfFile) => None,
+                Err(error) => return Err(error),
+            };
         }
         Ok(())
     }
@@ -1081,6 +1398,134 @@ impl FatVolume {
     where
         D: BlockDevice,
     {
+        self.find_directory_entry_by_lfn_inner(block_cache, dir_info, match_name, false)
+    }
+
+    /// Work out the 8.3 alias a long name will be filed under.
+    ///
+    /// Every FAT entry has a short name whether or not it has a long one, and
+    /// a reader that predates long names sees only the short one. It is not
+    /// part of what the caller asked for, so the caller does not supply it: it
+    /// has to be unique within the directory, and the directory is the only
+    /// thing that can decide that.
+    ///
+    /// The alias is derived from the long name so it stays recognisable --
+    /// upper-cased, spaces and interior dots removed, anything outside ASCII
+    /// or outside what 8.3 permits replaced with `_` -- and then given a `~1`
+    /// to `~4` tail until nothing in the directory answers to it. The base is
+    /// shortened to make room, so `A Real Book.epub` becomes `AREALB~1.EPU`.
+    ///
+    /// Past `~4` readability stops being worth the search, and the tail
+    /// becomes two characters of base followed by four hex digits of a digest
+    /// of the long name. That is 65536 candidates rather than the 999 a
+    /// decimal tail allows, and it almost always settles on the first, which
+    /// matters for a directory expected to hold thousands of files whose names
+    /// share an opening.
+    ///
+    /// Gives up with [`Error::FileAlreadyExists`] only once that space is
+    /// exhausted too.
+    pub(crate) fn generate_short_alias<D>(
+        &self,
+        block_cache: &mut BlockCache<D>,
+        dir_info: &DirectoryInfo,
+        long_name: &str,
+    ) -> Result<ShortFileName, Error<D::Error>>
+    where
+        D: BlockDevice,
+    {
+        let (base, ext) = short_name_basis(long_name);
+
+        // The readable forms first, so an alias glanced at on a computer still
+        // resembles the file it belongs to.
+        for tail in 1..=4u32 {
+            let candidate = compose_alias(&base, &ext, tail);
+            if let Some(sfn) = self.claim_alias(block_cache, dir_info, &candidate)? {
+                return Ok(sfn);
+            }
+        }
+
+        // Then spread out. Starting from the name's own digest means two
+        // different names rarely probe the same candidate first.
+        let digest = long_name_digest(long_name);
+        for probe in 0..=u16::MAX {
+            let candidate = compose_hashed_alias(&base, &ext, digest.wrapping_add(probe));
+            if let Some(sfn) = self.claim_alias(block_cache, dir_info, &candidate)? {
+                return Ok(sfn);
+            }
+        }
+        Err(Error::FileAlreadyExists)
+    }
+
+    /// Take `candidate` as an alias if the directory has nothing by that name.
+    fn claim_alias<D>(
+        &self,
+        block_cache: &mut BlockCache<D>,
+        dir_info: &DirectoryInfo,
+        candidate: &str,
+    ) -> Result<Option<ShortFileName>, Error<D::Error>>
+    where
+        D: BlockDevice,
+    {
+        // Built from ASCII by construction, so a parse failure would be a bug
+        // here rather than anything the caller did.
+        let Ok(sfn) = ShortFileName::create_from_str(candidate) else {
+            return Err(Error::FilenameError(FilenameError::InvalidCharacter));
+        };
+        if self.name_is_taken(block_cache, dir_info, candidate)? {
+            return Ok(None);
+        }
+        Ok(Some(sfn))
+    }
+
+    /// Is `name` already taken in this directory?
+    ///
+    /// FAT gives a directory one namespace, not two: an entry's long name and
+    /// its short name both live in it, and names that differ only by case are
+    /// the same name. Every name a new entry will answer to has to be checked
+    /// against both halves of it -- the long name *and* the short alias, since
+    /// an alias can equally well collide with some existing entry's long name.
+    /// Otherwise a directory ends up with two entries answering to one name,
+    /// and a lookup resolves to whichever comes first on disk.
+    pub(crate) fn name_is_taken<D>(
+        &self,
+        block_cache: &mut BlockCache<D>,
+        dir_info: &DirectoryInfo,
+        name: &str,
+    ) -> Result<bool, Error<D::Error>>
+    where
+        D: BlockDevice,
+    {
+        // Against existing long names, ignoring case.
+        match self.find_directory_entry_by_lfn_inner(block_cache, dir_info, name, true) {
+            Ok(_) => return Ok(true),
+            Err(Error::NotFound) => {}
+            Err(error) => return Err(error),
+        }
+
+        // Against existing short names. Only a name that is itself 8.3-shaped
+        // can collide with one, and ShortFileName comparison is already
+        // case-insensitive because it stores the upper-cased form.
+        if let Ok(as_short) = ShortFileName::create_from_str(name) {
+            match self.find_directory_entry(block_cache, dir_info, &as_short) {
+                Ok(_) => return Ok(true),
+                Err(Error::NotFound) => {}
+                Err(error) => return Err(error),
+            }
+        }
+
+        Ok(false)
+    }
+
+    fn find_directory_entry_by_lfn_inner<D>(
+        &self,
+        block_cache: &mut BlockCache<D>,
+        dir_info: &DirectoryInfo,
+        match_name: &str,
+        fold_case: bool,
+    ) -> Result<DirEntry, Error<D::Error>>
+    where
+        D: BlockDevice,
+    {
         let mut result = Err(Error::NotFound);
         enum SeqState<'a> {
             /// Looking for the first entry in an LFN sequence
@@ -1096,6 +1541,9 @@ impl FatVolume {
         }
 
         let mut state = SeqState::Waiting;
+        // Half of a surrogate pair that straddles the boundary between two
+        // entries, waiting for the half that completes it.
+        let mut pending_low: Option<u16> = None;
         self.iterate_dir_internal(block_cache, dir_info, |de, odde| {
             match state {
                 SeqState::Waiting => {
@@ -1107,24 +1555,20 @@ impl FatVolume {
                         #[cfg(feature = "log")]
                         debug!("{:02x} {:02x} {:04x?}", sequence, csum, buffer);
                         // trim padding and NUL words off the end of the file name (which is the part that comes first)
-                        for word in buffer
-                            .iter()
-                            .rev()
-                            .skip_while(|b| **b == 0xFFFF)
-                            .skip_while(|b| **b == 0x0000)
-                        {
-                            debug!("Looking at word {:04x}", *word);
-                            // UCS-2 16-bit values are valid Unicode code points - we do not expect surrogate pairs but if we find then, we give up.
-                            let Some(c) = char::from_u32(*word as u32) else {
-                                return ControlFlow::Continue(());
-                            };
-                            debug!("Looking at char '{}'", c);
-                            let Some(r) = remaining.strip_suffix(c) else {
-                                debug!("No, didn't want that");
-                                return ControlFlow::Continue(());
-                            };
-                            debug!("Liked it! {:?} is left", r);
-                            remaining = r;
+                        pending_low = None;
+                        if !strip_lfn_words(
+                            buffer
+                                .iter()
+                                .rev()
+                                .skip_while(|b| **b == 0xFFFF)
+                                .skip_while(|b| **b == 0x0000)
+                                .copied(),
+                            &mut remaining,
+                            &mut pending_low,
+                            fold_case,
+                        ) {
+                            debug!("No, didn't want that");
+                            return ControlFlow::Continue(());
                         }
                         if sequence == 1 {
                             // last piece
@@ -1169,19 +1613,14 @@ impl FatVolume {
                             state = SeqState::Waiting;
                             return ControlFlow::Continue(());
                         }
-                        for word in buffer.iter().rev() {
-                            // UCS-2 16-bit values are valid Unicode code points - we do not expect surrogate pairs but if we find then, we give up.
-                            debug!("Looking at word {:04x}", *word);
-                            let Some(c) = char::from_u32(*word as u32) else {
-                                return ControlFlow::Continue(());
-                            };
-                            debug!("Looking at char '{}'", c);
-                            let Some(r) = remaining.strip_suffix(c) else {
-                                debug!("No, didn't want that");
-                                return ControlFlow::Continue(());
-                            };
-                            debug!("Liked it! {:?} is left", r);
-                            remaining = r;
+                        if !strip_lfn_words(
+                            buffer.iter().rev().copied(),
+                            &mut remaining,
+                            &mut pending_low,
+                            fold_case,
+                        ) {
+                            debug!("No, didn't want that");
+                            return ControlFlow::Continue(());
                         }
                         if sequence == 1 {
                             // last piece
@@ -1414,7 +1853,11 @@ impl FatVolume {
         let new_cluster = match self.find_next_free_cluster(block_cache, start_cluster, end_cluster)
         {
             Ok(cluster) => cluster,
-            Err(_) if start_cluster.0 > RESERVED_ENTRIES => {
+            // Only "nothing free above the hint" is a reason to wrap around and
+            // look below it. A read that failed has not searched that range, so
+            // wrapping on it would let a working lower range hide the failure
+            // completely.
+            Err(Error::NotEnoughSpace) if start_cluster.0 > RESERVED_ENTRIES => {
                 debug!(
                     "Retrying, finding next free between {:?}..={:?}",
                     ClusterId(RESERVED_ENTRIES),
@@ -1438,20 +1881,32 @@ impl FatVolume {
             "Finding next free between {:?}..={:?}",
             new_cluster, end_cluster
         );
+        // The cluster is now claimed in the FAT and linked to its predecessor,
+        // so the allocation has happened whatever follows. What is left is
+        // finding where the *next* search should start, which is a hint and
+        // nothing more.
+        //
+        // Failing that search must not turn a completed allocation into an
+        // error. Claiming the last free cluster on the volume makes it fail
+        // every time -- there is genuinely nothing after it -- and reporting
+        // that would strand the cluster we just linked: callers allocating a
+        // file's first cluster never get to record it in the directory entry,
+        // and a directory being extended would keep a cluster that the zeroing
+        // below never reached, leaving whatever used to be there readable as
+        // directory entries.
+        //
+        // So the hint is best-effort. `None` means "start from the beginning
+        // next time", which is always safe, just slower. A device error here
+        // is dropped rather than reported, because the operation the caller
+        // asked for did succeed; anything genuinely wrong with the card will
+        // resurface on the next read or write that depends on it.
         self.next_free_cluster =
             match self.find_next_free_cluster(block_cache, new_cluster, end_cluster) {
                 Ok(cluster) => Some(cluster),
-                Err(_) if new_cluster.0 > RESERVED_ENTRIES => {
-                    match self.find_next_free_cluster(
-                        block_cache,
-                        ClusterId(RESERVED_ENTRIES),
-                        end_cluster,
-                    ) {
-                        Ok(cluster) => Some(cluster),
-                        Err(e) => return Err(e),
-                    }
-                }
-                Err(e) => return Err(e),
+                Err(_) if new_cluster.0 > RESERVED_ENTRIES => self
+                    .find_next_free_cluster(block_cache, ClusterId(RESERVED_ENTRIES), end_cluster)
+                    .ok(),
+                Err(_) => None,
             };
         debug!("Next free cluster is {:?}", self.next_free_cluster);
         // Record that we've allocated a cluster
@@ -1546,30 +2001,81 @@ impl FatVolume {
 
     /// Create a new directory.
     ///
-    /// 1) Creates the directory entry in the parent
-    /// 2) Allocates a new cluster to hold the new directory
-    /// 3) Writes out the `.` and `..` entries in the new directory
+    /// 1) Allocates a cluster to hold the new directory
+    /// 2) Writes out its `.` and `..` entries and blanks the rest
+    /// 3) Only then creates the entry naming it in the parent
+    ///
+    /// That order matters: an entry whose stored cluster is zero reads back as
+    /// the root directory, so publishing the name first would let a failure
+    /// leave a folder on the card claiming to be root. If anything fails the
+    /// cluster is released, since nothing refers to it.
+    ///
+    /// With `long_name`, the entry gets a long-name chain as well, so a folder
+    /// can be named the way a file can. `sfn` is its alias either way.
     pub(crate) fn make_dir<D, T>(
         &mut self,
         block_cache: &mut BlockCache<D>,
         time_source: &T,
         parent: ClusterId,
         sfn: ShortFileName,
+        long_name: Option<&str>,
         att: Attributes,
     ) -> Result<(), Error<D::Error>>
     where
         D: BlockDevice,
         T: TimeSource,
     {
-        let mut new_dir_entry_in_parent =
-            self.write_new_directory_entry(block_cache, time_source, parent, sfn, att)?;
-        if new_dir_entry_in_parent.cluster == ClusterId::EMPTY {
-            new_dir_entry_in_parent.cluster = self.alloc_cluster(block_cache, None, false)?;
-            // update the parent dir with the cluster of the new dir
-            self.write_entry_to_disk(block_cache, &new_dir_entry_in_parent)?;
+        // Everything the new directory is made of comes first, and only then
+        // does anything in the parent name it. Publishing the name first and
+        // filling it in afterwards means a failure in between leaves an entry
+        // whose stored cluster is zero -- which is read back as the root
+        // directory, so a folder that could not be created appears on the card
+        // claiming to be the root.
+        //
+        // Nothing between the allocation and the end of this is reachable by
+        // any name, so if any part of it fails the cluster is handed back.
+        let new_cluster = self.alloc_cluster(block_cache, None, false)?;
+        match self.build_and_publish_dir(
+            block_cache,
+            time_source,
+            parent,
+            sfn,
+            long_name,
+            att,
+            new_cluster,
+        ) {
+            Ok(entry) => {
+                debug!("Made new dir entry {:?}", entry);
+                Ok(())
+            }
+            Err(error) => {
+                self.release_unpublished_cluster(block_cache, new_cluster);
+                Err(error)
+            }
         }
-        let new_dir_start_block = self.cluster_to_block(new_dir_entry_in_parent.cluster);
-        debug!("Made new dir entry {:?}", new_dir_entry_in_parent);
+    }
+
+    /// Lay out a freshly allocated directory cluster and then name it in its
+    /// parent.
+    ///
+    /// Every failure in here is one the caller undoes the same way, by
+    /// releasing the cluster, which is why none of it is split out.
+    #[allow(clippy::too_many_arguments)]
+    fn build_and_publish_dir<D, T>(
+        &mut self,
+        block_cache: &mut BlockCache<D>,
+        time_source: &T,
+        parent: ClusterId,
+        sfn: ShortFileName,
+        long_name: Option<&str>,
+        att: Attributes,
+        new_cluster: ClusterId,
+    ) -> Result<DirEntry, Error<D::Error>>
+    where
+        D: BlockDevice,
+        T: TimeSource,
+    {
+        let new_dir_start_block = self.cluster_to_block(new_cluster);
         let now = time_source.get_timestamp();
         let fat_type = self.get_fat_type();
         // A blank block
@@ -1581,7 +2087,7 @@ impl FatVolume {
             ctime: now,
             attributes: att,
             // point at ourselves
-            cluster: new_dir_entry_in_parent.cluster,
+            cluster: new_cluster,
             size: 0,
             entry_block: new_dir_start_block,
             entry_offset: 0,
@@ -1622,7 +2128,58 @@ impl FatVolume {
             block_cache.write_back()?;
         }
 
-        Ok(())
+        // The directory is complete; give it its name. Nothing up to here is
+        // reachable by any name, so whatever happens the card is left as it
+        // was apart from the cluster -- which the caller releases on any Err
+        // out of this function.
+        match long_name {
+            Some(long_name) => self.write_directory_entry_lfn(
+                block_cache,
+                parent,
+                long_name,
+                sfn,
+                att,
+                new_cluster,
+                0,
+                now,
+                now,
+            ),
+            None => self.write_new_directory_entry(
+                block_cache,
+                time_source,
+                parent,
+                sfn,
+                att,
+                new_cluster,
+            ),
+        }
+
+    }
+
+    /// Hand back a cluster that was allocated but never named.
+    ///
+    /// This only runs after something else has already failed, so it is best
+    /// effort by nature. The free count is adjusted only if the FAT write
+    /// actually landed: a count claiming space that is still allocated hands
+    /// out clusters which are not there, where a merely pessimistic one only
+    /// wastes them.
+    fn release_unpublished_cluster<D>(
+        &mut self,
+        block_cache: &mut BlockCache<D>,
+        cluster: ClusterId,
+    ) where
+        D: BlockDevice,
+    {
+        if self
+            .update_fat(block_cache, cluster, ClusterId::EMPTY)
+            .is_ok()
+        {
+            if let Some(count) = self.free_clusters_count.as_mut() {
+                *count = count.saturating_add(1);
+            }
+            // Free again, so as good a place as any to look next.
+            self.next_free_cluster = Some(cluster);
+        }
     }
 }
 

@@ -1,3 +1,7 @@
+// `mod utils` is compiled into each test binary separately, so anything only
+// some of them use looks unused to the rest.
+#![allow(dead_code)]
+
 //! Useful library code for tests
 
 use std::io::prelude::*;
@@ -58,6 +62,111 @@ pub enum Error {
 ///
 /// The slice should be a multiple of `embedded_sdmmc::Block::LEN` bytes in
 /// length. If it isn't the trailing data is discarded.
+use std::cell::Cell;
+
+/// Wraps a device and fails reads that land in a chosen block range.
+///
+/// `write_region` does the same for writes, which is the only way to reach
+/// some sites: allocating a cluster reads the FAT to find a free one and then
+/// writes it to claim it, and the read is usually served from the block cache
+/// the preceding chain walk already filled.
+pub struct FailRegion<D> {
+    pub inner: D,
+    pub region: Cell<Option<(u32, u32)>>,
+    pub write_region: Cell<Option<(u32, u32)>>,
+    pub injected: Cell<u32>,
+    /// Counts writes landing in `write_region`. Used both to find which write
+    /// is the interesting one and, via `fail_write_number`, to fail it.
+    pub writes_seen: Cell<u32>,
+    /// Fail every write to `write_region` from this number onward. Used to
+    /// cut a multi-write operation off partway through, the way losing power
+    /// would.
+    pub fail_writes_from: Cell<Option<u32>>,
+    /// Fail exactly one write to `write_region`: the one with this number.
+    /// Everything before and after it goes through, which is what a single
+    /// bad write looks like and what the cleanup path needs in order to run.
+    pub fail_write_number: Cell<Option<u32>>,
+}
+
+#[derive(Debug)]
+pub enum FailError {
+    Injected,
+    /// Carried so a real device failure is distinguishable in test output.
+    Inner(#[allow(dead_code)] Error),
+}
+
+// `Error::DeviceError` requires the device's error type to implement
+// `core::error::Error` since the thiserror migration in 0.10.
+impl core::fmt::Display for FailError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(f, "{self:?}")
+    }
+}
+
+impl core::error::Error for FailError {}
+
+impl<D> BlockDevice for FailRegion<D>
+where
+    D: BlockDevice<Error = Error>,
+{
+    type Error = FailError;
+
+    fn read(&self, blocks: &mut [Block], start: BlockIdx) -> Result<(), Self::Error> {
+        if let Some((from, to)) = self.region.get() {
+            let last = start.0 + blocks.len() as u32;
+            if start.0 < to && last > from {
+                self.injected.set(self.injected.get() + 1);
+                return Err(FailError::Injected);
+            }
+        }
+        self.inner.read(blocks, start).map_err(FailError::Inner)
+    }
+
+    fn write(&self, blocks: &[Block], start: BlockIdx) -> Result<(), Self::Error> {
+        if let Some((from, to)) = self.write_region.get() {
+            let last = start.0 + blocks.len() as u32;
+            if start.0 < to && last > from {
+                self.writes_seen.set(self.writes_seen.get() + 1);
+                // `fail_writes_from`, when set, is the whole rule: everything
+                // before the cut-off goes through so a multi-write operation
+                // can be stopped partway rather than at its first step.
+                let fail = match self.fail_writes_from.get() {
+                    Some(from) => self.writes_seen.get() >= from,
+                    None => match self.fail_write_number.get() {
+                        None => true,
+                        Some(n) => n == self.writes_seen.get(),
+                    },
+                };
+                if fail {
+                    self.injected.set(self.injected.get() + 1);
+                    return Err(FailError::Injected);
+                }
+            }
+        }
+        self.inner.write(blocks, start).map_err(FailError::Inner)
+    }
+
+    fn num_blocks(&self) -> Result<BlockCount, Self::Error> {
+        self.inner.num_blocks().map_err(FailError::Inner)
+    }
+}
+
+
+impl<D> FailRegion<D> {
+    /// A device that passes everything through until it is armed.
+    pub fn new(inner: D) -> Self {
+        FailRegion {
+            inner,
+            region: Cell::new(None),
+            write_region: Cell::new(None),
+            injected: Cell::new(0),
+            writes_seen: Cell::new(0),
+            fail_writes_from: Cell::new(None),
+            fail_write_number: Cell::new(None),
+        }
+    }
+}
+
 pub struct RamDisk<T> {
     contents: std::cell::RefCell<T>,
 }
