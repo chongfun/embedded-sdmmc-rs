@@ -7,7 +7,7 @@
 
 use core::ops::ControlFlow;
 
-use embedded_sdmmc::{Mode, ShortFileName, VolumeIdx, VolumeManager};
+use embedded_sdmmc::{ClusterId, Mode, ShortFileName, VolumeIdx, VolumeManager};
 
 mod utils;
 
@@ -263,6 +263,57 @@ fn the_moved_entry_carries_the_sources_chain_and_size() {
         after.name,
         ShortFileName::create_from_str("AREALB~1.EPU").unwrap(),
         "under the new alias"
+    );
+}
+
+/// What [`ClusterId::value`] is for: a caller writes the number down and
+/// recognises the same file later, under a name it could not have predicted.
+/// Neither name can do that job — the long name is whatever the move was told
+/// to use, and the 8.3 alias is unique only within one directory and is handed
+/// to the next file that needs one as soon as an entry is deleted.
+#[test]
+fn a_recorded_cluster_number_identifies_a_file_across_a_move() {
+    let manager = manager();
+    let volume = manager.open_volume(VolumeIdx(0)).expect("volume");
+    let root = volume.open_root_dir().expect("root");
+    let source = root.open_dir("TEST").expect("TEST");
+
+    for (name, fill) in [("FIRST.TMP", 1u8), ("SECOND.TMP", 2u8)] {
+        let file = source
+            .open_file_in_dir(name, Mode::ReadWriteCreate)
+            .expect("create");
+        file.write(&[fill; 1500]).expect("write");
+        file.close().expect("close");
+    }
+
+    let recorded = source
+        .find_directory_entry("FIRST.TMP")
+        .expect("look up")
+        .cluster
+        .value();
+    let other = source
+        .find_directory_entry("SECOND.TMP")
+        .expect("look up")
+        .cluster
+        .value();
+    assert_ne!(recorded, other, "two files must not answer to one number");
+    assert_ne!(
+        recorded,
+        ClusterId::EMPTY.value(),
+        "a file with a body starts somewhere"
+    );
+
+    source
+        .move_file_in_dir_lfn("FIRST.TMP", &root, "A Real Book.epub")
+        .expect("link");
+
+    assert_eq!(
+        root.find_directory_entry("AREALB~1.EPU")
+            .expect("look up")
+            .cluster
+            .value(),
+        recorded,
+        "the number has to outlive the name it was found under"
     );
 }
 

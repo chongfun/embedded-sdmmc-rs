@@ -20,6 +20,21 @@ impl ClusterId {
     pub const ROOT_DIR: ClusterId = ClusterId(0xFFFF_FFFC);
     /// Magic value indicating that the cluster is allocated and is the final cluster for the file
     pub const END_OF_FILE: ClusterId = ClusterId(0xFFFF_FFFF);
+
+    /// The numeric ID.
+    ///
+    /// For a caller that needs to write down which chain an entry pointed at
+    /// and recognise it again later. Renaming or moving an entry does not
+    /// change where its data starts, so this identifies the file across both,
+    /// where neither name can: a long name is whatever it was last given, and
+    /// an 8.3 alias is unique only within its directory and is handed to the
+    /// next file that needs one as soon as the entry holding it is deleted.
+    ///
+    /// Note that a zero-length file starts at [`ClusterId::EMPTY`], so this
+    /// tells two of those apart no better than their names do.
+    pub const fn value(self) -> u32 {
+        self.0
+    }
 }
 
 impl core::ops::Add<u32> for ClusterId {
