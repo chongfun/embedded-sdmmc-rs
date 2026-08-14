@@ -317,6 +317,142 @@ fn a_recorded_cluster_number_identifies_a_file_across_a_move() {
     );
 }
 
+/// The two halves taken separately, which is what a caller reaches for when it
+/// wants the second name to *stay* for a while.
+///
+/// What is actually pinned here is narrow, so this checks only that: the link
+/// names the same chain as the source, neither entry knows about the other,
+/// and retiring one with an unlink leaves the survivor whole. That the chain
+/// stays allocated for as long as a name holds it is true of this driver and
+/// of nothing else — FAT counts no references, so a delete through either name
+/// from anywhere frees it under both. `link_file_in_dir_lfn` spells out what
+/// that means for a caller using a link as recovery evidence.
+#[test]
+fn a_link_holds_the_chain_until_its_name_is_taken_away() {
+    let manager = manager();
+    let volume = manager.open_volume(VolumeIdx(0)).expect("volume");
+    let root = volume.open_root_dir().expect("root");
+    let source = root.open_dir("TEST").expect("TEST");
+
+    let staged = source
+        .open_file_in_dir("STAGED.TMP", Mode::ReadWriteCreate)
+        .expect("create");
+    staged.write(&[9u8; 10000]).expect("write");
+    staged.close().expect("close");
+    let chain = source
+        .find_directory_entry("STAGED.TMP")
+        .expect("look up")
+        .cluster;
+
+    let alias = source
+        .link_file_in_dir_lfn("STAGED.TMP", &root, "A Real Book.epub")
+        .expect("link");
+    assert_eq!(
+        alias,
+        ShortFileName::create_from_str("AREALB~1.EPU").unwrap()
+    );
+
+    // Both names, one chain, and neither entry knows about the other.
+    let by_scratch = source.find_directory_entry("STAGED.TMP").expect("source");
+    let by_book = root.find_directory_entry("AREALB~1.EPU").expect("dest");
+    assert_eq!(by_scratch.cluster, chain);
+    assert_eq!(by_book.cluster, chain);
+    assert_eq!(by_book.size, by_scratch.size);
+
+    // Retiring one with an unlink leaves the other whole -- this is the half
+    // the caller owns, and the only correct way to take it.
+    source.delete_entry_in_dir("STAGED.TMP").expect("unlink");
+    assert!(matches!(
+        source.find_directory_entry("STAGED.TMP"),
+        Err(embedded_sdmmc::Error::NotFound)
+    ));
+    let survivor = root.find_directory_entry("AREALB~1.EPU").expect("survivor");
+    assert_eq!(survivor.cluster, chain, "the chain did not move");
+    assert_eq!(read_all(&root, "AREALB~1.EPU"), vec![9u8; 10000]);
+}
+
+/// The wrapper carries its own cross-manager check, so it needs its own test:
+/// the one below goes through `move_file_in_dir_lfn`, and a link that reached
+/// the raw handles without this guard would write into a different filesystem
+/// with nothing to report.
+#[test]
+fn linking_into_another_managers_directory_is_refused() {
+    let manager_a = VolumeManager::new(
+        utils::make_block_device(utils::DISK_SOURCE).expect("disk image"),
+        utils::make_time_source(),
+    );
+    let manager_b = VolumeManager::new(
+        utils::make_block_device(utils::DISK_SOURCE).expect("disk image"),
+        utils::make_time_source(),
+    );
+
+    let vol_a = manager_a.open_volume(VolumeIdx(1)).expect("open A");
+    let vol_b = manager_b.open_volume(VolumeIdx(1)).expect("open B");
+    let root_a = vol_a.open_root_dir().expect("root A");
+    let root_b = vol_b.open_root_dir().expect("root B");
+
+    let staged = root_a
+        .open_file_in_dir("STAGED.TMP", Mode::ReadWriteCreate)
+        .expect("create on A");
+    staged.write(b"belongs to A").expect("write");
+    staged.close().expect("close");
+
+    let attempt = root_a.link_file_in_dir_lfn("STAGED.TMP", &root_b, "A Real Book.epub");
+    assert!(
+        matches!(attempt, Err(embedded_sdmmc::Error::BadHandle)),
+        "a destination from another manager must be refused, got {:?}",
+        attempt.err()
+    );
+    assert!(matches!(
+        root_b.find_directory_entry("AREALB~1.EPU"),
+        Err(embedded_sdmmc::Error::NotFound)
+    ));
+
+    // Checked last, because reading a handle consumes it: the two really are
+    // indistinguishable by value, so nothing below the wrapper could catch it.
+    assert_eq!(
+        root_a.to_raw_directory(),
+        root_b.to_raw_directory(),
+        "expected colliding handles; without them this proves nothing"
+    );
+}
+
+/// A link is refused wherever a whole move would be, since it is the half that
+/// does the checking. The move's own tests cover each reason; this one pins
+/// that the exposed half applies them too rather than being a back door.
+#[test]
+fn a_link_refuses_a_name_already_taken() {
+    let manager = manager();
+    let volume = manager.open_volume(VolumeIdx(0)).expect("volume");
+    let root = volume.open_root_dir().expect("root");
+    let source = root.open_dir("TEST").expect("TEST");
+
+    let staged = source
+        .open_file_in_dir("STAGED.TMP", Mode::ReadWriteCreate)
+        .expect("create");
+    staged.write(b"body").expect("write");
+    staged.close().expect("close");
+
+    let taken = root
+        .create_file_in_dir_lfn("A Real Book.epub")
+        .expect("first");
+    taken.close().expect("close");
+
+    assert!(matches!(
+        source.link_file_in_dir_lfn("STAGED.TMP", &root, "A Real Book.epub"),
+        Err(embedded_sdmmc::Error::FileAlreadyExists)
+    ));
+
+    // And the source is untouched, so the caller can still finish or abandon.
+    assert_eq!(
+        source
+            .find_directory_entry("STAGED.TMP")
+            .expect("source")
+            .size,
+        4
+    );
+}
+
 // ---------------------------------------------------------------------------
 // What the primitive refuses.
 //

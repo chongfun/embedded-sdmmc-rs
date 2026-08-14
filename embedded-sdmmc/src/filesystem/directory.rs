@@ -267,6 +267,36 @@ where
         )
     }
 
+    /// Give `source_name` in this directory a second name, in this directory
+    /// or another one on the same volume, and return the 8.3 alias the new
+    /// entry was filed under.
+    ///
+    /// Half of a move, leaving one chain under two names. See
+    /// [`VolumeManager::link_file_in_dir_lfn`] for what a caller holding that
+    /// state must not do until it takes one of the names away again: writing
+    /// through either, or deleting either with its clusters, ruins the other.
+    pub fn link_file_in_dir_lfn<N>(
+        &self,
+        source_name: N,
+        dest_directory: &Self,
+        long_name: &str,
+    ) -> Result<ShortFileName, Error<D::Error>>
+    where
+        N: ToShortFileName,
+    {
+        // See the note in `VolumeManager::link_file_in_dir_lfn`: handles are
+        // numbers, and two managers hand out the same ones.
+        if !core::ptr::eq(self.volume_mgr, dest_directory.volume_mgr) {
+            return Err(Error::BadHandle);
+        }
+        self.volume_mgr.link_file_in_dir_lfn(
+            self.raw_directory,
+            source_name,
+            dest_directory.raw_directory,
+            long_name,
+        )
+    }
+
     /// Delete a file/directory.
     ///
     /// See [`VolumeManager::delete_entry_in_dir`] for details, except the

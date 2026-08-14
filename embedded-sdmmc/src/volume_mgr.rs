@@ -1005,10 +1005,12 @@ where
     /// Move a file to another name, in this or another directory on the same
     /// volume.
     ///
-    /// Nothing is read or copied and no clusters are allocated: the file keeps
-    /// the chain it already has, and only the directory entries naming it
-    /// change. Moving a book across a card costs two directory writes rather
-    /// than its own length in reads and writes.
+    /// No file data is read or copied and none of its clusters are allocated
+    /// or freed: the file keeps the chain it already has, and only the
+    /// directory entries naming it change. Moving a book across a card costs
+    /// two directory writes rather than its own length in reads and writes.
+    /// The destination *directory* may still have to grow by a cluster to
+    /// hold the new entry, as it would for any other file created in it.
     ///
     /// Those two writes cannot be made one, so a crash between them leaves the
     /// chain with both names. That is the only way to observe it -- this call
@@ -1041,6 +1043,10 @@ where
     /// - [`Error::FileAlreadyExists`] if `long_name` is taken in the
     ///   destination, compared as described on
     ///   [`Self::create_file_in_dir_lfn`].
+    /// - [`Error::NotEnoughSpace`] if the destination directory has no free
+    ///   entry slots and cannot be grown -- a full FAT16 root, or a volume
+    ///   with no free cluster to extend any other directory with. The source
+    ///   is untouched, so the move simply did not happen.
     pub fn move_file_in_dir_lfn<N>(
         &self,
         source_directory: RawDirectory,
@@ -1078,23 +1084,48 @@ where
     /// Writes a long-named directory entry in `dest_directory` pointing at the
     /// cluster chain, size, attributes and timestamps that `source_name`
     /// already has in `source_directory`. No file data is read or copied, and
-    /// no clusters are allocated.
+    /// none of the file's clusters are allocated or freed — the point of the
+    /// call is that both names describe one chain. The destination *directory*
+    /// may still grow by a cluster to hold the new entry, as it would for any
+    /// other file created in it.
     ///
-    /// This is half of a move, and it is deliberately not public. While both
-    /// names exist they are two entries holding their own copies of the start
-    /// cluster and the length, and nothing keeps those copies in step: writing
-    /// or truncating through one name updates that entry alone, leaving the
-    /// other describing a file that is no longer there. FAT has no way to
-    /// share that metadata, so the state is only safe as long as nobody
-    /// mutates through either name -- which is a rule callers cannot be given
-    /// and expected to keep.
+    /// This is half of a move, and the half that leaves behind a state FAT has
+    /// no way to keep consistent. **The caller owns the other half.**
     ///
-    /// [`VolumeManager::move_file_in_dir_lfn`] therefore owns both halves and
-    /// never hands the intermediate state to a caller. It can still be *found*
-    /// on disk after a crash between the two writes; recovery is to unlink the
-    /// unwanted name with [`Self::delete_entry_in_dir`], which takes a name
-    /// away without freeing the chain behind it. Never delete-and-reclaim it,
-    /// because reclaiming frees clusters the surviving name still points at.
+    /// While both names exist they are two entries with their own copies of
+    /// the start cluster and the length, and nothing keeps those copies in
+    /// step. Until one name is gone, the caller must not, through either name:
+    ///
+    /// - write, truncate, or otherwise change the file's length. Only the
+    ///   entry written through is updated; the other is left describing a file
+    ///   that is no longer there.
+    /// - delete and reclaim. [`Self::delete_entry_in_dir`] takes a name away
+    ///   without freeing the chain behind it, and is the only correct way to
+    ///   retire one of a pair — reclaiming frees clusters the survivor still
+    ///   points at.
+    ///
+    /// [`Self::move_file_in_dir_lfn`] is this call plus that unlink, and is
+    /// what almost every caller wants. Take the halves separately only to hold
+    /// a second name open deliberately across something else.
+    ///
+    /// One use is recovery after power loss. A caller that wrote down "my file
+    /// starts at cluster C" cannot tell that file from a stranger later on: a
+    /// freed chain goes back to the pool and its number is handed to whatever
+    /// is written next. A name the caller linked itself and has not yet
+    /// retired narrows that gap — but only as far as the rule above is kept.
+    /// FAT counts no references, so nothing but the discipline of whoever
+    /// mounts the volume holds the pair together: an ordinary delete through
+    /// either name frees the shared chain and leaves the other entry pointing
+    /// into free space, and no later read can tell that it happened. So a
+    /// surviving link is evidence about the chain *under the assumption that
+    /// no other implementation has reclaimed through the pair*. Against power
+    /// loss with a single owner, that assumption holds. Against a volume also
+    /// edited elsewhere it does not, and a caller needing certainty there has
+    /// to carry identity of its own — a digest of the contents, say — rather
+    /// than infer it from the filesystem.
+    ///
+    /// The same intermediate state is what a crash inside a move leaves on
+    /// disk, so a caller that recovers from those already keeps the rule.
     ///
     /// The source is named rather than passed as a [`DirEntry`] so that this
     /// call can establish three things a bare entry cannot. The entry is read
@@ -1123,7 +1154,11 @@ where
     ///   destination, compared as described on
     ///   [`Self::create_file_in_dir_lfn`]. The destination's 8.3 alias is
     ///   derived there too, so it cannot collide.
-    pub(crate) fn link_file_in_dir_lfn<N>(
+    /// - [`Error::NotEnoughSpace`] if the destination directory has no free
+    ///   entry slots and cannot be grown -- a full FAT16 root, or a volume
+    ///   with no free cluster to extend any other directory with. Nothing is
+    ///   written, so the file keeps its one name.
+    pub fn link_file_in_dir_lfn<N>(
         &self,
         source_directory: RawDirectory,
         source_name: N,
