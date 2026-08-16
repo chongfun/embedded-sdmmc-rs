@@ -376,3 +376,58 @@ fn a_replay_repairs_a_half_mirrored_free() {
         "the two FAT copies disagree after a replay: primary {primary_entry:#x}, mirror {mirror_entry:#x}",
     );
 }
+
+#[test]
+fn the_same_operations_are_reachable_from_a_directory() {
+    // The shape the reclaim driver actually uses. It holds the directory the
+    // entry stood in; making it carry a RawVolume alongside every directory
+    // would put the plumbing in every signature it touches, for a device
+    // that only ever has one volume open.
+    let manager = manager();
+    let (volume, chain) = multi_cluster_file(&manager);
+    let root = manager.open_root_dir(volume).expect("root");
+    let directory = root.to_directory(&manager);
+
+    // Walking, and the same guarantee about what comes back.
+    let mut walked = vec![chain[0]];
+    let mut at = chain[0];
+    while let Some(next) = directory.next_cluster_in_chain(at).expect("walk") {
+        walked.push(next);
+        at = next;
+    }
+    assert_eq!(
+        walked.iter().map(|c| c.value()).collect::<Vec<_>>(),
+        chain.iter().map(|c| c.value()).collect::<Vec<_>>(),
+    );
+
+    // And freeing, idempotently.
+    directory.delete_entry_in_dir("BIG.DAT").expect("unlink");
+    for cluster in &chain {
+        directory.free_cluster(*cluster).expect("free");
+        directory.free_cluster(*cluster).expect("free again");
+    }
+    assert!(matches!(
+        directory.next_cluster_in_chain(chain[0]),
+        Err(Error::UnterminatedFatChain)
+    ));
+}
+
+#[test]
+fn a_directory_refuses_the_same_clusters_the_volume_does() {
+    // The validation is the volume's, not something the convenience layer
+    // gets to skip.
+    let manager = manager();
+    let volume = manager.open_raw_volume(VolumeIdx(0)).expect("volume");
+    let root = manager.open_root_dir(volume).expect("root");
+    let directory = root.to_directory(&manager);
+    for not_a_cluster in [0u32, 1, u32::MAX / 8] {
+        assert!(matches!(
+            directory.free_cluster(ClusterId::new(not_a_cluster)),
+            Err(Error::BadCluster)
+        ));
+        assert!(matches!(
+            directory.next_cluster_in_chain(ClusterId::new(not_a_cluster)),
+            Err(Error::BadCluster)
+        ));
+    }
+}

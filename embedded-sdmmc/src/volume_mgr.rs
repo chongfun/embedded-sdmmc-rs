@@ -1228,6 +1228,31 @@ where
         Ok(short_alias)
     }
 
+    /// The volume an open directory belongs to.
+    ///
+    /// For an operation that is really the volume's -- freeing a cluster,
+    /// following a chain -- reached from the directory handle a caller
+    /// already has. Saves threading a `RawVolume` alongside every directory
+    /// through code that only ever works on one volume.
+    ///
+    /// Crate-internal, and the reason is the type it returns. [`RawVolume`]
+    /// tells its holder not to drop it and to close it when finished,
+    /// because ordinarily one exists only where a volume was opened. This
+    /// opens nothing -- it reads back the handle the directory is already
+    /// standing on -- so a caller following that advice would close a volume
+    /// it does not own, out from under the directory it got it from. The
+    /// public way to reach these operations is
+    /// [`Directory::next_cluster_in_chain`] and [`Directory::free_cluster`],
+    /// which take no handle and hand none out.
+    pub(crate) fn volume_of_dir(
+        &self,
+        directory: RawDirectory,
+    ) -> Result<RawVolume, Error<D::Error>> {
+        let data = self.data.try_borrow().map_err(|_| Error::LockError)?;
+        let dir_idx = data.get_dir_by_id(directory)?;
+        Ok(data.open_dirs[dir_idx].raw_volume)
+    }
+
     /// The cluster following `cluster` in its chain, or `None` at the end.
     ///
     /// For a caller that means to free a chain and must survive being

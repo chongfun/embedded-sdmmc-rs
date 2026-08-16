@@ -111,6 +111,36 @@ where
         }
     }
 
+    /// The cluster following `cluster` in its chain, on the volume this
+    /// directory is on, or `None` at the end.
+    ///
+    /// A volume operation reached through a directory, because a caller
+    /// taking a chain apart already holds the directory the entry stood in
+    /// and would otherwise have to carry a `RawVolume` beside it everywhere.
+    ///
+    /// See [`VolumeManager::next_cluster_in_chain`] for what the answers
+    /// mean -- in particular that `Ok(Some(c))` is always a data cluster on
+    /// this volume, and that a walk into already-freed space says so rather
+    /// than looking like an end.
+    pub fn next_cluster_in_chain(
+        &self,
+        cluster: ClusterId,
+    ) -> Result<Option<ClusterId>, Error<D::Error>> {
+        let volume = self.volume_mgr.volume_of_dir(self.raw_directory)?;
+        self.volume_mgr.next_cluster_in_chain(volume, cluster)
+    }
+
+    /// Mark one cluster free on the volume this directory is on, whether or
+    /// not it already was.
+    ///
+    /// See [`VolumeManager::free_cluster`]: idempotent by design, so a
+    /// recorded list of clusters can be replayed after an interruption
+    /// without knowing how far the previous attempt got.
+    pub fn free_cluster(&self, cluster: ClusterId) -> Result<(), Error<D::Error>> {
+        let volume = self.volume_mgr.volume_of_dir(self.raw_directory)?;
+        self.volume_mgr.free_cluster(volume, cluster)
+    }
+
     /// Open a directory.
     ///
     /// You can then read the directory entries with `iterate_dir` and `open_file_in_dir`.
