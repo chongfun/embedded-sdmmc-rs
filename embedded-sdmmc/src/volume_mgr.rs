@@ -1228,6 +1228,90 @@ where
         Ok(short_alias)
     }
 
+    /// The cluster following `cluster` in its chain, or `None` at the end.
+    ///
+    /// For a caller that means to free a chain and must survive being
+    /// interrupted while doing it. Freeing destroys the links, so every
+    /// cluster to be freed has to be discovered -- and recorded somewhere
+    /// durable -- before the first entry is cleared. Walking back into a
+    /// `Ok(Some(c))` means `c` is a data cluster on this volume, so a caller
+    /// walking a chain into a journal can record what it is given without
+    /// re-examining it. The two ways that can fail are kept apart:
+    ///
+    /// - [`Error::UnterminatedFatChain`] -- the entry is free. Someone has
+    ///   already taken this chain apart, and what followed is unknowable.
+    ///   Reported the same way on FAT16 and FAT32, which disagree about how
+    ///   a free entry reads.
+    /// - [`Error::BadCluster`] -- the cluster asked about, or the successor
+    ///   found, is not a cluster on this volume. A number out of a journal
+    ///   that no longer matches the card looks exactly like this, and is
+    ///   refused here rather than turned into a read of whatever lies at
+    ///   that offset.
+    pub fn next_cluster_in_chain(
+        &self,
+        volume: RawVolume,
+        cluster: ClusterId,
+    ) -> Result<Option<ClusterId>, Error<D::Error>> {
+        let mut data = self.data.try_borrow_mut().map_err(|_| Error::LockError)?;
+        let data = data.deref_mut();
+        let volume_idx = data.get_volume_by_id(volume)?;
+        match &data.open_volumes[volume_idx].volume_type {
+            VolumeType::Fat(fat) => {
+                // Checked before the walk, not only after it: the FAT
+                // location is computed arithmetically from the number, and
+                // the walker panics outright above a quarter of `u32::MAX`.
+                if !fat.is_data_cluster(cluster) {
+                    return Err(Error::BadCluster);
+                }
+                match fat.next_cluster(&mut data.block_cache, cluster) {
+                    // A free entry. FAT32 already calls this an unterminated
+                    // chain; FAT16 hands back cluster zero, which is not a
+                    // cluster, and a caller that recorded it would wedge
+                    // later trying to free it.
+                    Ok(next) if next == ClusterId::EMPTY => Err(Error::UnterminatedFatChain),
+                    Ok(next) if !fat.is_data_cluster(next) => Err(Error::BadCluster),
+                    Ok(next) => Ok(Some(next)),
+                    Err(Error::EndOfFile) => Ok(None),
+                    Err(e) => Err(e),
+                }
+            }
+        }
+    }
+
+    /// Marks one cluster free, whether or not it already was.
+    ///
+    /// Idempotent on purpose. A reclaim that names its clusters in advance
+    /// and frees them one at a time can be interrupted at any point, and the
+    /// only way to finish it afterwards is to run it again from a recorded
+    /// list -- which necessarily re-frees whatever the previous attempt
+    /// reached. Refuses the reserved entries and anything past the end of the
+    /// volume, since writing those corrupts the FAT for every other file.
+    ///
+    /// The FAT itself is the record; the free-cluster *count* is not
+    /// crash-atomic with it. A reset between freeing an entry and that count
+    /// reaching FSInfo leaves the persisted count low, and a replay then
+    /// finds the cluster already free and does not count it again. The error
+    /// is pessimistic -- the volume believes it has less room than it does --
+    /// and allocation scans the FAT rather than trusting the count, so the
+    /// space is still found. Left that way deliberately: making the count
+    /// atomic with the entry needs its own transaction, which is the problem
+    /// this primitive exists to be a building block for.
+    pub fn free_cluster(
+        &self,
+        volume: RawVolume,
+        cluster: ClusterId,
+    ) -> Result<(), Error<D::Error>> {
+        let mut data = self.data.try_borrow_mut().map_err(|_| Error::LockError)?;
+        let data = data.deref_mut();
+        let volume_idx = data.get_volume_by_id(volume)?;
+        match &mut data.open_volumes[volume_idx].volume_type {
+            VolumeType::Fat(fat) => {
+                fat.free_one_cluster(&mut data.block_cache, cluster)?;
+            }
+        }
+        Ok(())
+    }
+
     /// Delete a closed file or empty directory with the given filename, if it exists.
     pub fn delete_entry_in_dir<N>(
         &self,

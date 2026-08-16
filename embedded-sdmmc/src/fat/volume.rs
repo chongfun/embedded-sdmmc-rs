@@ -569,7 +569,7 @@ impl FatVolume {
     }
 
     /// Write a new entry in the FAT
-    fn update_fat<D>(
+    pub(crate) fn update_fat<D>(
         &mut self,
         block_cache: &mut BlockCache<D>,
         cluster: ClusterId,
@@ -1927,6 +1927,108 @@ impl FatVolume {
     }
 
     /// Marks the input cluster as an EOF and all the subsequent clusters in the chain as free
+    /// Whether this identifies a data cluster on this volume.
+    ///
+    /// The first two entries are the media descriptor and the end-of-chain
+    /// marker rather than clusters, and anything at or past
+    /// `cluster_count + RESERVED_ENTRIES` does not exist. Neither has a FAT
+    /// entry inside the region the FAT covers, so following or freeing one
+    /// reads or writes something else.
+    pub(crate) fn is_data_cluster(&self, cluster: ClusterId) -> bool {
+        cluster.0 >= RESERVED_ENTRIES && cluster.0 < self.cluster_count + RESERVED_ENTRIES
+    }
+
+    /// Whether this cluster's FAT entry says free.
+    ///
+    /// Reads the entry rather than inferring from [`Self::next_cluster`],
+    /// whose answer for a free entry differs between FAT16 and FAT32 (one
+    /// returns cluster zero, the other an unterminated-chain error).
+    pub(crate) fn cluster_is_free<D>(
+        &self,
+        block_cache: &mut BlockCache<D>,
+        cluster: ClusterId,
+    ) -> Result<bool, Error<D::Error>>
+    where
+        D: BlockDevice,
+    {
+        match &self.fat_specific_info {
+            FatSpecificInfo::Fat16(_) => {
+                let fat_offset = cluster.0 * 2;
+                let this_fat_block_num = self.lba_start + self.fat_start.offset_bytes(fat_offset);
+                let this_fat_ent_offset = (fat_offset % Block::LEN_U32) as usize;
+                let block = block_cache.read(this_fat_block_num)?;
+                let entry =
+                    LittleEndian::read_u16(&block[this_fat_ent_offset..=this_fat_ent_offset + 1]);
+                Ok(entry == 0x0000)
+            }
+            FatSpecificInfo::Fat32(_) => {
+                let fat_offset = cluster.0 * 4;
+                let this_fat_block_num = self.lba_start + self.fat_start.offset_bytes(fat_offset);
+                let this_fat_ent_offset = (fat_offset % Block::LEN_U32) as usize;
+                let block = block_cache.read(this_fat_block_num)?;
+                let entry =
+                    LittleEndian::read_u32(&block[this_fat_ent_offset..=this_fat_ent_offset + 3])
+                        & 0x0FFF_FFFF;
+                Ok(entry == 0x0000_0000)
+            }
+        }
+    }
+
+    /// Marks one cluster free, whether or not it already was.
+    ///
+    /// Returns whether the entry changed, so the free-cluster bookkeeping is
+    /// adjusted once per cluster actually freed rather than once per call.
+    ///
+    /// Unlike [`Self::truncate_cluster_chain`] this follows no links: the
+    /// caller names the cluster. That is what makes it replayable. A reclaim
+    /// interrupted part way has already destroyed the links that would find
+    /// the rest of its chain, so the only way to finish one is to have
+    /// recorded the cluster numbers before freeing began -- and then a replay
+    /// necessarily re-frees clusters the previous attempt got to.
+    pub(crate) fn free_one_cluster<D>(
+        &mut self,
+        block_cache: &mut BlockCache<D>,
+        cluster: ClusterId,
+    ) -> Result<bool, Error<D::Error>>
+    where
+        D: BlockDevice,
+    {
+        // Writing a reserved entry would corrupt the FAT for every file on
+        // the volume; writing past the end would corrupt whatever lives
+        // there instead.
+        if !self.is_data_cluster(cluster) {
+            return Err(Error::BadCluster);
+        }
+        // The read decides only whether the free-space accounting should
+        // move. The write happens either way, including when this entry
+        // already reads free.
+        //
+        // That is not a wasted write on a replay. `update_fat` mirrors the
+        // entry into the second FAT with a separate device write, so a reset
+        // between the two leaves the copies disagreeing -- and it leaves the
+        // primary, which is the one this read consults, already saying free.
+        // Skipping the write then would declare the cluster reclaimed and
+        // leave the second FAT holding the old chain link for good. A replay
+        // that cannot repair the half of the mutation it is most likely to
+        // have interrupted is not a replay.
+        let was_free = self.cluster_is_free(block_cache, cluster)?;
+        self.update_fat(block_cache, cluster, ClusterId::EMPTY)?;
+        if was_free {
+            return Ok(false);
+        }
+        if let Some(ref mut next_free_cluster) = self.next_free_cluster {
+            if next_free_cluster.0 > cluster.0 {
+                *next_free_cluster = cluster;
+            }
+        } else {
+            self.next_free_cluster = Some(cluster);
+        }
+        if let Some(ref mut free_clusters_count) = self.free_clusters_count {
+            *free_clusters_count += 1;
+        }
+        Ok(true)
+    }
+
     pub(crate) fn truncate_cluster_chain<D>(
         &mut self,
         block_cache: &mut BlockCache<D>,

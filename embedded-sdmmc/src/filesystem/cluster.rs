@@ -35,6 +35,18 @@ impl ClusterId {
     pub const fn value(self) -> u32 {
         self.0
     }
+
+    /// The cluster with this numeric ID.
+    ///
+    /// The inverse of [`ClusterId::value`], for a caller that wrote cluster
+    /// numbers down and has come back to act on them -- a reclaim that
+    /// recorded a chain before freeing it, and has to name those clusters
+    /// again after a reset. Nothing is validated here: whether the number
+    /// addresses a real cluster on a particular volume is that volume's
+    /// question, and the operations that touch the FAT ask it.
+    pub const fn new(value: u32) -> Self {
+        ClusterId(value)
+    }
 }
 
 impl core::ops::Add<u32> for ClusterId {
