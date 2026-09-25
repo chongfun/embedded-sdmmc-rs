@@ -963,6 +963,40 @@ impl FatVolume {
         )
     }
 
+    /// Write a short-named directory entry describing a cluster chain that
+    /// already exists: the 8.3 counterpart of
+    /// [`Self::write_linked_directory_entry_lfn`], for a name that already is
+    /// an 8.3 name and wants no long-name entries beside it.
+    ///
+    /// The same half of a move, with the same contract about the window
+    /// between the two writes.
+    pub(crate) fn write_linked_directory_entry<D>(
+        &mut self,
+        block_cache: &mut BlockCache<D>,
+        dir_cluster: ClusterId,
+        name: ShortFileName,
+        source: &DirEntry,
+    ) -> Result<DirEntry, Error<D::Error>>
+    where
+        D: BlockDevice,
+    {
+        let slots = self.find_free_directory_slots(block_cache, dir_cluster, 1)?;
+        let slot = slots[0];
+        let mut entry = DirEntry::new(
+            name,
+            source.attributes,
+            source.cluster,
+            source.ctime,
+            slot.block,
+            slot.offset,
+        );
+        entry.mtime = source.mtime;
+        entry.size = source.size;
+        let raw = entry.serialize(self.get_fat_type());
+        write_directory_slot(block_cache, slot, &raw)?;
+        Ok(entry)
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn write_directory_entry_lfn<D>(
         &mut self,

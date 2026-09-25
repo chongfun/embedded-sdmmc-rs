@@ -1228,6 +1228,128 @@ where
         Ok(short_alias)
     }
 
+    /// Move a file to another 8.3 name, in this or another directory on the
+    /// same volume, as a plain short entry with no long name beside it.
+    ///
+    /// [`Self::move_file_in_dir_lfn`] with the destination named the way the
+    /// source is, by `ShortFileName`. The long-name variant derives an alias
+    /// for whatever it is given, so a name that already fits 8.3 would still
+    /// land under `NAME~1.EXT`, and a caller that finds its files by short
+    /// name would lose track of them. Cache files called `BOOK.BIN` and
+    /// `S000.BIN` are that caller.
+    ///
+    /// Everything else is the long-name move's contract, including the state
+    /// a crash between the two writes leaves and the recovery for it: unlink
+    /// the name you do not want with [`Self::delete_entry_in_dir`], and do not
+    /// truncate through either name. Fails as the long-name move does, with
+    /// [`Error::FileAlreadyExists`] when `dest_name` is already answered to in
+    /// the destination by any entry's long or short name.
+    pub fn move_file_in_dir<N, M>(
+        &self,
+        source_directory: RawDirectory,
+        source_name: N,
+        dest_directory: RawDirectory,
+        dest_name: M,
+    ) -> Result<(), Error<D::Error>>
+    where
+        N: ToShortFileName,
+        M: ToShortFileName,
+    {
+        let source_name = source_name.to_short_filename().map_err(Error::FilenameError)?;
+        let dest_name = dest_name.to_short_filename().map_err(Error::FilenameError)?;
+
+        self.link_file_in_dir(source_directory, source_name, dest_directory, dest_name)?;
+
+        match self.delete_entry_in_dir(source_directory, source_name) {
+            Ok(()) => Ok(()),
+            Err(error) => {
+                // As the long-name move: a move that could not finish is a
+                // move that did not happen, or both names remain and the
+                // documented recovery applies.
+                let _ = self.delete_entry_in_dir(dest_directory, dest_name);
+                Err(error)
+            }
+        }
+    }
+
+    /// Give an existing file a second 8.3 name, in this or another directory
+    /// on the same volume, as a plain short entry.
+    ///
+    /// The short-named half of [`Self::move_file_in_dir`], under the contract
+    /// of [`Self::link_file_in_dir_lfn`]: both names describe one chain, FAT
+    /// keeps no count of that, and the caller owns taking one name away again
+    /// with [`Self::delete_entry_in_dir`]. Refuses what the long-name link
+    /// refuses. `dest_name` is checked against the destination's whole
+    /// namespace, long names included, the way a created name is.
+    pub fn link_file_in_dir<N, M>(
+        &self,
+        source_directory: RawDirectory,
+        source_name: N,
+        dest_directory: RawDirectory,
+        dest_name: M,
+    ) -> Result<(), Error<D::Error>>
+    where
+        N: ToShortFileName,
+        M: ToShortFileName,
+    {
+        let mut data = self.data.try_borrow_mut().map_err(|_| Error::LockError)?;
+        let data = data.deref_mut();
+
+        let source_dir_idx = data.get_dir_by_id(source_directory)?;
+        let source_volume_id = data.open_dirs[source_dir_idx].raw_volume;
+        let dest_dir_idx = data.get_dir_by_id(dest_directory)?;
+        let dest_volume_id = data.open_dirs[dest_dir_idx].raw_volume;
+
+        // See `link_file_in_dir_lfn`: a cluster number means nothing against
+        // another volume's FAT.
+        if source_volume_id != dest_volume_id {
+            return Err(Error::Unsupported);
+        }
+        let volume_idx = data.get_volume_by_id(dest_volume_id)?;
+
+        let source_sfn = source_name.to_short_filename().map_err(Error::FilenameError)?;
+        let dest_sfn = dest_name.to_short_filename().map_err(Error::FilenameError)?;
+
+        let source = match &data.open_volumes[volume_idx].volume_type {
+            VolumeType::Fat(fat) => fat.find_directory_entry(
+                &mut data.block_cache,
+                &data.open_dirs[source_dir_idx],
+                &source_sfn,
+            )?,
+        };
+
+        if source.attributes.is_directory() {
+            return Err(Error::OpenedDirAsFile);
+        }
+
+        if data.file_is_open(source_volume_id, &source) {
+            return Err(Error::FileAlreadyOpen);
+        }
+
+        // One namespace across long and short names, as for a created file,
+        // so the check takes the name spelled out. An 8.3 name is at most
+        // twelve characters and always fits.
+        let mut spelled = heapless::String::<12>::new();
+        {
+            use core::fmt::Write as _;
+            let _ = write!(spelled, "{}", dest_sfn);
+        }
+        data.check_name_is_free(volume_idx, dest_dir_idx, spelled.as_str())?;
+
+        let cluster = data.open_dirs[dest_dir_idx].cluster;
+        match &mut data.open_volumes[volume_idx].volume_type {
+            VolumeType::Fat(fat) => {
+                fat.write_linked_directory_entry(
+                    &mut data.block_cache,
+                    cluster,
+                    dest_sfn,
+                    &source,
+                )?;
+            }
+        }
+        Ok(())
+    }
+
     /// The volume an open directory belongs to.
     ///
     /// For an operation that is really the volume's -- freeing a cluster,

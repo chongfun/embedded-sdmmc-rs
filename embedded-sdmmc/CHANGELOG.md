@@ -6,6 +6,15 @@ The format is based on [Keep a Changelog] and this project adheres to [Semantic 
 
 ## [Unreleased]
 
+### Added
+
+- `move_file_in_dir` and `link_file_in_dir` on `VolumeManager` and `Directory`:
+  the short-name counterparts of the long-name move and link. They file the
+  exact 8.3 name asked for as a plain entry, where the long-name variants
+  derive a `NAME~1.EXT` alias for whatever they are given, so a caller that
+  finds its files by short name keeps finding them after a move. Same two
+  writes, same window between them, same recovery by unlinking.
+
 ## [Version 0.10.0] - 2026-07-24
 
 ### Changed

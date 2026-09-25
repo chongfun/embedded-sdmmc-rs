@@ -700,3 +700,192 @@ fn a_completed_move_leaves_no_second_name_to_strand() {
         "exactly one entry should name this chain"
     );
 }
+
+// ---------------------------------------------------------------------------
+// The short-named move: the same two writes, and the exact name asked for
+// ---------------------------------------------------------------------------
+
+/// The reason the short variant exists. A long-name move of `BOOK.BIN` files
+/// it under a derived alias, `BOOK~1.BIN`, and a caller that opens its files
+/// by short name would then miss it. The short move lands the exact name and
+/// writes no long-name entries beside it.
+#[test]
+fn a_short_named_move_lands_under_exactly_that_name() {
+    let manager = manager();
+    let volume = manager.open_volume(VolumeIdx(0)).expect("volume");
+    let root = volume.open_root_dir().expect("root");
+    let source = root.open_dir("TEST").expect("TEST");
+
+    let staged = source
+        .open_file_in_dir("STAGED.TMP", Mode::ReadWriteCreate)
+        .expect("create");
+    staged.write(b"the whole index").expect("write");
+    staged.close().expect("close");
+
+    source
+        .move_file_in_dir("STAGED.TMP", &root, "BOOK.BIN")
+        .expect("move");
+
+    assert_eq!(read_all(&root, "BOOK.BIN"), b"the whole index");
+    assert!(
+        matches!(
+            root.find_directory_entry("BOOK~1.BIN"),
+            Err(embedded_sdmmc::Error::NotFound)
+        ),
+        "no alias was derived; the name asked for is the name filed"
+    );
+    assert!(
+        !listing(&source).iter().any(|n| n == "STAGED.TMP"),
+        "the old name must be gone"
+    );
+
+    // No long-name entries either: the listing with long names shows none
+    // for this file.
+    let mut storage = [0u8; 64];
+    let mut lfn_buffer = embedded_sdmmc::LfnBuffer::new(&mut storage);
+    let mut long_name_seen = false;
+    root.iterate_dir_lfn(&mut lfn_buffer, |entry, long| {
+        if entry.name.to_string() == "BOOK.BIN" {
+            long_name_seen = long.is_some();
+        }
+        ControlFlow::Continue(())
+    })
+    .expect("iterate");
+    assert!(!long_name_seen, "a short move writes no long-name entries");
+}
+
+#[test]
+fn a_short_named_move_onto_a_taken_name_is_refused() {
+    let manager = manager();
+    let volume = manager.open_volume(VolumeIdx(0)).expect("volume");
+    let root = volume.open_root_dir().expect("root");
+    let source = root.open_dir("TEST").expect("TEST");
+
+    let staged = source
+        .open_file_in_dir("STAGED.TMP", Mode::ReadWriteCreate)
+        .expect("create");
+    staged.write(b"body").expect("write");
+    staged.close().expect("close");
+    let occupant = root
+        .open_file_in_dir("BOOK.BIN", Mode::ReadWriteCreate)
+        .expect("create occupant");
+    occupant.write(b"do not clobber me").expect("write");
+    occupant.close().expect("close");
+
+    assert!(
+        matches!(
+            source.move_file_in_dir("STAGED.TMP", &root, "BOOK.BIN"),
+            Err(embedded_sdmmc::Error::FileAlreadyExists)
+        ),
+        "a short name already in the destination must be refused"
+    );
+    assert_eq!(read_all(&root, "BOOK.BIN"), b"do not clobber me");
+    assert_eq!(read_all(&source, "STAGED.TMP"), b"body");
+
+    // The namespace is one across long and short names: a long name that
+    // spells the same thing in another case takes the short name too.
+    let long_occupant = root
+        .create_file_in_dir_lfn("cont.bin")
+        .expect("create long occupant");
+    long_occupant.write(b"long").expect("write");
+    long_occupant.close().expect("close");
+    assert!(
+        matches!(
+            source.move_file_in_dir("STAGED.TMP", &root, "CONT.BIN"),
+            Err(embedded_sdmmc::Error::FileAlreadyExists)
+        ),
+        "a long name answering to the same spelling refuses the short one"
+    );
+    assert_eq!(read_all(&source, "STAGED.TMP"), b"body");
+}
+
+/// The short link is the same half of a move as the long one: the new entry
+/// describes the source's chain, size and times, and unlinking the old name
+/// afterwards leaves the survivor whole.
+#[test]
+fn a_short_named_link_carries_the_sources_chain_and_size() {
+    let manager = manager();
+    let volume = manager.open_volume(VolumeIdx(0)).expect("volume");
+    let root = volume.open_root_dir().expect("root");
+    let source = root.open_dir("TEST").expect("TEST");
+
+    let staged = source
+        .open_file_in_dir("STAGED.TMP", Mode::ReadWriteCreate)
+        .expect("create");
+    staged.write(&[9u8; 1500]).expect("write");
+    staged.close().expect("close");
+
+    let before = source.find_directory_entry("STAGED.TMP").expect("look up");
+    source
+        .link_file_in_dir("STAGED.TMP", &root, "S000.BIN")
+        .expect("link");
+    let after = root.find_directory_entry("S000.BIN").expect("look up");
+
+    assert_eq!(after.cluster, before.cluster, "same first cluster");
+    assert_eq!(after.size, before.size, "same size");
+    assert_eq!(after.ctime, before.ctime, "created when the data was");
+    assert_eq!(
+        after.name,
+        ShortFileName::create_from_str("S000.BIN").unwrap(),
+        "under exactly the name asked for"
+    );
+    assert_eq!(read_all(&root, "S000.BIN"), vec![9u8; 1500]);
+    assert_eq!(read_all(&source, "STAGED.TMP"), vec![9u8; 1500]);
+
+    // Finish the move by hand, the way a recovery does.
+    source.delete_entry_in_dir("STAGED.TMP").expect("unlink");
+    assert_eq!(read_all(&root, "S000.BIN"), vec![9u8; 1500]);
+}
+
+/// The short move has two writes and the same window between them as the
+/// long one. Cutting in at the second stops the unlink and the undo, both
+/// names remain, and unlinking the one not wanted recovers it.
+#[test]
+fn a_short_named_move_interrupted_between_its_two_writes_is_recoverable() {
+    let device = utils::FailRegion::new(
+        utils::make_block_device(utils::DISK_SOURCE).expect("disk image"),
+    );
+    let manager: VolumeManager<_, _, 4, 4, 1> =
+        VolumeManager::new_with_limits(device, utils::make_time_source(), 0xAA);
+    let volume = manager.open_volume(VolumeIdx(1)).expect("volume");
+    let root = volume.open_root_dir().expect("root");
+
+    let staged = root
+        .open_file_in_dir("STAGED.TMP", Mode::ReadWriteCreate)
+        .expect("create");
+    staged.write(b"interrupted").expect("write");
+    staged.close().expect("close");
+
+    // Source and destination share a directory, so every write lands in one
+    // cluster and can be counted. A short move is two writes: one installs
+    // the new entry, one retires the old. Cutting in at the second stops the
+    // move between its halves, and stops the undo as well.
+    let entry = root.find_directory_entry("STAGED.TMP").expect("entry");
+    let dir_block = entry.entry_block.0;
+    let cluster_start = dir_block - (dir_block % 8);
+    manager.device(|d| d.write_region.set(Some((cluster_start, cluster_start + 8))));
+    manager.device(|d| d.fail_writes_from.set(Some(2)));
+    let attempt = root.move_file_in_dir("STAGED.TMP", &root, "BOOK.BIN");
+    manager.device(|d| d.fail_writes_from.set(None));
+    manager.device(|d| d.write_region.set(None));
+
+    assert!(attempt.is_err(), "the move reported success despite failing");
+    assert_eq!(
+        manager.device(|d| d.injected.get()),
+        2,
+        "expected both the unlink and the undo to have been stopped"
+    );
+
+    assert_eq!(read_all(&root, "STAGED.TMP"), b"interrupted");
+    assert_eq!(read_all(&root, "BOOK.BIN"), b"interrupted");
+    let before = root.find_directory_entry("STAGED.TMP").expect("entry");
+    let after = root.find_directory_entry("BOOK.BIN").expect("entry");
+    assert_eq!(after.cluster, before.cluster, "one chain under two names");
+
+    root.delete_entry_in_dir("STAGED.TMP").expect("recover");
+    assert_eq!(read_all(&root, "BOOK.BIN"), b"interrupted");
+    assert!(matches!(
+        root.find_directory_entry("STAGED.TMP"),
+        Err(embedded_sdmmc::Error::NotFound)
+    ));
+}

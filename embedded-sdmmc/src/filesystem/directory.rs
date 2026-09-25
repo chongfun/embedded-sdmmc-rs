@@ -327,6 +327,60 @@ where
         )
     }
 
+    /// Move `source_name` out of this directory to an 8.3 name, in this
+    /// directory or another one on the same volume, as a plain short entry.
+    ///
+    /// See [`VolumeManager::move_file_in_dir`] for why this exists beside the
+    /// long-name move, and for the contract the two share.
+    pub fn move_file_in_dir<N, M>(
+        &self,
+        source_name: N,
+        dest_directory: &Self,
+        dest_name: M,
+    ) -> Result<(), Error<D::Error>>
+    where
+        N: ToShortFileName,
+        M: ToShortFileName,
+    {
+        // See the note in `VolumeManager::link_file_in_dir_lfn`: handles are
+        // numbers, and two managers hand out the same ones.
+        if !core::ptr::eq(self.volume_mgr, dest_directory.volume_mgr) {
+            return Err(Error::BadHandle);
+        }
+        self.volume_mgr.move_file_in_dir(
+            self.raw_directory,
+            source_name,
+            dest_directory.raw_directory,
+            dest_name,
+        )
+    }
+
+    /// Give `source_name` in this directory a second 8.3 name, in this
+    /// directory or another one on the same volume, as a plain short entry.
+    ///
+    /// See [`VolumeManager::link_file_in_dir`], and the long-name link for
+    /// what a caller holding two names for one chain must not do.
+    pub fn link_file_in_dir<N, M>(
+        &self,
+        source_name: N,
+        dest_directory: &Self,
+        dest_name: M,
+    ) -> Result<(), Error<D::Error>>
+    where
+        N: ToShortFileName,
+        M: ToShortFileName,
+    {
+        if !core::ptr::eq(self.volume_mgr, dest_directory.volume_mgr) {
+            return Err(Error::BadHandle);
+        }
+        self.volume_mgr.link_file_in_dir(
+            self.raw_directory,
+            source_name,
+            dest_directory.raw_directory,
+            dest_name,
+        )
+    }
+
     /// Delete a file/directory.
     ///
     /// See [`VolumeManager::delete_entry_in_dir`] for details, except the
