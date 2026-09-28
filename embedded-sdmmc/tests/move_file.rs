@@ -889,3 +889,113 @@ fn a_short_named_move_interrupted_between_its_two_writes_is_recoverable() {
         Err(embedded_sdmmc::Error::NotFound)
     ));
 }
+
+/// A manager over a device that can fail writes after they land.
+type FaultyManager =
+    VolumeManager<utils::FailRegion<utils::RamDisk<Vec<u8>>>, utils::TestTimeSource, 4, 4, 1>;
+
+/// A move over a device whose source-unlink write lands and then reports an
+/// error, the way an SD card can take a sector and fail the status read after
+/// it. `blind` also stops reads of the source directory from then on.
+fn move_whose_unlink_lands_then_fails(
+    short: bool,
+    blind: bool,
+) -> (
+    Result<(), embedded_sdmmc::Error<utils::FailError>>,
+    FaultyManager,
+) {
+    let device =
+        utils::FailRegion::new(utils::make_block_device(utils::DISK_SOURCE).expect("disk image"));
+    let manager: VolumeManager<_, _, 4, 4, 1> =
+        VolumeManager::new_with_limits(device, utils::make_time_source(), 0xAA);
+    let attempt = {
+        let volume = manager.open_volume(VolumeIdx(0)).expect("volume");
+        let root = volume.open_root_dir().expect("root");
+        let source = root.open_dir("TEST").expect("TEST");
+        let staged = source
+            .open_file_in_dir("STAGED.TMP", Mode::ReadWriteCreate)
+            .expect("create");
+        staged.write(b"the only copy").expect("write");
+        staged.close().expect("close");
+
+        // The source directory's sector takes one write, the unlink, and
+        // reports it failed; the destination is the root, elsewhere.
+        let block = source
+            .find_directory_entry("STAGED.TMP")
+            .expect("entry")
+            .entry_block
+            .0;
+        manager.device(|d| {
+            d.write_region.set(Some((block, block + 1)));
+            d.fail_write_number.set(Some(1));
+            d.land_before_failing.set(true);
+            d.blind_after_failing.set(blind);
+        });
+        let attempt = if short {
+            source.move_file_in_dir("STAGED.TMP", &root, "MOVED.BIN")
+        } else {
+            source.move_file_in_dir_lfn("STAGED.TMP", &root, "A Real Book.epub")
+        };
+        manager.device(|d| {
+            d.write_region.set(None);
+            d.region.set(None);
+            d.fail_write_number.set(None);
+        });
+        assert_eq!(
+            manager.device(|d| d.writes_seen.get()),
+            1,
+            "the unlink was the one write to the source directory, and it was failed"
+        );
+        attempt
+    };
+    (attempt, manager)
+}
+
+fn after_the_move(manager: &FaultyManager, moved_name: &str) -> (bool, Option<Vec<u8>>) {
+    let volume = manager.open_volume(VolumeIdx(0)).expect("volume");
+    let root = volume.open_root_dir().expect("root");
+    let source = root.open_dir("TEST").expect("TEST");
+    let source_left = source.find_directory_entry("STAGED.TMP").is_ok();
+    let moved = root
+        .find_directory_entry(moved_name)
+        .is_ok()
+        .then(|| read_all(&root, moved_name));
+    (source_left, moved)
+}
+
+/// The unlink landed, so the move happened: the destination is the file's
+/// only name, and the move reports success rather than undoing itself into a
+/// file with no name at all.
+#[test]
+fn a_move_whose_unlink_landed_despite_an_error_keeps_the_new_name() {
+    for short in [false, true] {
+        let (attempt, manager) = move_whose_unlink_lands_then_fails(short, false);
+        assert!(attempt.is_ok(), "short={short}: {attempt:?}");
+        let name = if short { "MOVED.BIN" } else { "AREALB~1.EPU" };
+        let (source_left, moved) = after_the_move(&manager, name);
+        assert!(!source_left, "short={short}: the old name is gone");
+        assert_eq!(
+            moved.as_deref(),
+            Some(&b"the only copy"[..]),
+            "short={short}"
+        );
+    }
+}
+
+/// The unlink may have landed and the directory will not say: the error is
+/// returned and the destination stays, so the file has at least one name.
+#[test]
+fn a_move_that_cannot_tell_whether_its_unlink_landed_keeps_the_new_name() {
+    for short in [false, true] {
+        let (attempt, manager) = move_whose_unlink_lands_then_fails(short, true);
+        assert!(attempt.is_err(), "short={short}");
+        let name = if short { "MOVED.BIN" } else { "AREALB~1.EPU" };
+        let (source_left, moved) = after_the_move(&manager, name);
+        assert!(!source_left, "short={short}: the unlink did land");
+        assert_eq!(
+            moved.as_deref(),
+            Some(&b"the only copy"[..]),
+            "short={short}"
+        );
+    }
+}

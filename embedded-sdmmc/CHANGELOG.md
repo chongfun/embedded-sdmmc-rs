@@ -38,6 +38,13 @@ The format is based on [Keep a Changelog] and this project adheres to [Semantic 
 - A multi-block write on SPI that failed part way returned before the stop
   token, leaving the card taking blocks. The token now follows once the
   `CMD25` write has been attempted, and the first error is returned.
+- A move whose source unlink reported an error unlinked the destination to
+  undo itself, but an error from a write does not mean it did not land: an
+  SD card can take the sector and fail the status read after it. If the
+  unlink had landed, the undo took the file's last name and stranded its
+  chain. Both moves now look for the source again first: still there, the
+  destination is undone as before; gone, the move completed and returns
+  `Ok`; unanswerable, the destination stays and the error is returned.
 
 ## [Version 0.10.0] - 2026-07-24
 

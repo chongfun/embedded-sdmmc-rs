@@ -1021,11 +1021,18 @@ where
     /// surviving name still points at. A caller that needs to know which name
     /// it meant to keep has to record that intent durably before starting.
     ///
-    /// If the destination is written but the source cannot be unlinked, the
-    /// destination is unlinked again so the move looks as though it never
-    /// happened, and the original error is returned. Should that second
-    /// unlink fail too, both names are left in place and the error is still
-    /// returned -- the same state a crash leaves, recovered the same way.
+    /// If the destination is written but unlinking the source reports an
+    /// error, the source is looked for again before anything is undone,
+    /// because an error from a write is not proof the write did not land: an
+    /// SD card can take the sector and then fail the status read after it.
+    /// A source still there is a move that did not happen, so the destination
+    /// is unlinked again and the original error returned; should that unlink
+    /// fail too, both names are left in place and the error is still returned
+    /// -- the same state a crash leaves, recovered the same way. A source that
+    /// is gone is a move that did happen, and returns `Ok`. A directory that
+    /// will not answer leaves the destination alone and returns the error:
+    /// possibly two names, which recovery handles, rather than possibly none,
+    /// which it cannot.
     ///
     /// Fails with:
     ///
@@ -1066,15 +1073,41 @@ where
 
         match self.delete_entry_in_dir(source_directory, source_name) {
             Ok(()) => Ok(()),
-            Err(error) => {
-                // Put the destination back, so a move that failed is a move
-                // that did not happen rather than one the caller is left to
-                // finish. If this fails too, both names remain and the caller
-                // is where a crash would have put them -- which the returned
-                // error, and the documented recovery, already cover.
-                let _ = self.delete_entry_in_dir(dest_directory, short_alias);
+            Err(error) => self.settle_failed_unlink(
+                source_directory,
+                source_name,
+                dest_directory,
+                short_alias,
+                error,
+            ),
+        }
+    }
+
+    /// Finish a move whose source unlink reported `error`, from what the
+    /// source directory says now. See [`Self::move_file_in_dir_lfn`].
+    fn settle_failed_unlink(
+        &self,
+        source_directory: RawDirectory,
+        source_name: ShortFileName,
+        dest_directory: RawDirectory,
+        dest_name: ShortFileName,
+        error: Error<D::Error>,
+    ) -> Result<(), Error<D::Error>> {
+        match self.find_directory_entry(source_directory, source_name) {
+            // The move did not happen. Put the destination back, so a move
+            // that failed is a move that did not happen rather than one the
+            // caller is left to finish. If this fails too, both names remain
+            // and the caller is where a crash would have put them -- which the
+            // returned error, and the documented recovery, already cover.
+            Ok(_) => {
+                let _ = self.delete_entry_in_dir(dest_directory, dest_name);
                 Err(error)
             }
+            // The unlink landed despite the error: the destination is the one
+            // name the file has, and taking it away would strand the chain.
+            Err(Error::NotFound) => Ok(()),
+            // Not knowing is not a reason to risk taking the last name.
+            Err(_) => Err(error),
         }
     }
 
@@ -1238,8 +1271,10 @@ where
     /// name would lose track of them. Cache files called `BOOK.BIN` and
     /// `S000.BIN` are that caller.
     ///
-    /// Everything else is the long-name move's contract, including the state
-    /// a crash between the two writes leaves and the recovery for it: unlink
+    /// Everything else is the long-name move's contract, including what a
+    /// failed source unlink returns once the source has been looked for
+    /// again, the state a crash between the two writes leaves and the
+    /// recovery for it: unlink
     /// the name you do not want with [`Self::delete_entry_in_dir`], and do not
     /// truncate through either name. Fails as the long-name move does, with
     /// [`Error::FileAlreadyExists`] when `dest_name` is already answered to in
@@ -1262,13 +1297,14 @@ where
 
         match self.delete_entry_in_dir(source_directory, source_name) {
             Ok(()) => Ok(()),
-            Err(error) => {
-                // As the long-name move: a move that could not finish is a
-                // move that did not happen, or both names remain and the
-                // documented recovery applies.
-                let _ = self.delete_entry_in_dir(dest_directory, dest_name);
-                Err(error)
-            }
+            // As the long-name move, including looking again before undoing.
+            Err(error) => self.settle_failed_unlink(
+                source_directory,
+                source_name,
+                dest_directory,
+                dest_name,
+                error,
+            ),
         }
     }
 

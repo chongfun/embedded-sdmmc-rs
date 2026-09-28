@@ -310,6 +310,8 @@ fn a_replay_repairs_a_half_mirrored_free() {
         writes_seen: Cell::new(0),
         fail_writes_from: Cell::new(None),
         fail_write_number: Cell::new(None),
+        land_before_failing: Cell::new(false),
+        blind_after_failing: Cell::new(false),
     };
     let manager: VolumeManager<_, _, 4, 4, 1> =
         VolumeManager::new_with_limits(device, utils::make_time_source(), 0xAA);

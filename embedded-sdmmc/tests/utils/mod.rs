@@ -86,6 +86,14 @@ pub struct FailRegion<D> {
     /// Everything before and after it goes through, which is what a single
     /// bad write looks like and what the cleanup path needs in order to run.
     pub fail_write_number: Cell<Option<u32>>,
+    /// Let a write that is failed reach the disk first, then report the
+    /// error: a card that took the sector and failed the status read after
+    /// it. An error is not proof that the write did not land.
+    pub land_before_failing: Cell<bool>,
+    /// Once a write has been failed, fail reads of `write_region` too: the
+    /// card that took a sector and then stopped answering, so nothing can
+    /// find out whether it did.
+    pub blind_after_failing: Cell<bool>,
 }
 
 #[derive(Debug)]
@@ -139,6 +147,12 @@ where
                 };
                 if fail {
                     self.injected.set(self.injected.get() + 1);
+                    if self.land_before_failing.get() {
+                        self.inner.write(blocks, start).map_err(FailError::Inner)?;
+                    }
+                    if self.blind_after_failing.get() {
+                        self.region.set(self.write_region.get());
+                    }
                     return Err(FailError::Injected);
                 }
             }
@@ -162,6 +176,8 @@ impl<D> FailRegion<D> {
             writes_seen: Cell::new(0),
             fail_writes_from: Cell::new(None),
             fail_write_number: Cell::new(None),
+            land_before_failing: Cell::new(false),
+            blind_after_failing: Cell::new(false),
         }
     }
 }
