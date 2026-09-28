@@ -151,7 +151,6 @@ where
     }
 }
 
-
 impl<D> FailRegion<D> {
     /// A device that passes everything through until it is armed.
     pub fn new(inner: D) -> Self {

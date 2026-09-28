@@ -85,6 +85,17 @@ where
         self.volume_mgr.read(self.raw_file, buffer)
     }
 
+    /// Read whole blocks of the file straight into `blocks`
+    ///
+    /// See [`VolumeManager::read_blocks`] for details, except the file given
+    /// is this file.
+    pub fn read_blocks(
+        &self,
+        blocks: &mut [crate::Block],
+    ) -> Result<usize, crate::Error<D::Error>> {
+        self.volume_mgr.read_blocks(self.raw_file, blocks)
+    }
+
     /// Write to the file
     ///
     /// See [`VolumeManager::write`] for details, except the file given is this

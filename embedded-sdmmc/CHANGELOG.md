@@ -14,6 +14,12 @@ The format is based on [Keep a Changelog] and this project adheres to [Semantic 
   derive a `NAME~1.EXT` alias for whatever they are given, so a caller that
   finds its files by short name keeps finding them after a move. Same two
   writes, same window between them, same recovery by unlinking.
+- `read_blocks` on `VolumeManager` and `File`: reads whole blocks of a file
+  straight into the caller's buffer, asking the device for each run that
+  lies together on the disk (the rest of a cluster, at most) in one call.
+  `read` fetches through the single-block cache one block per device call
+  whatever its buffer size, which on an SPI card is a command and a token
+  wait per block. The position must be on a block boundary.
 
 ## [Version 0.10.0] - 2026-07-24
 

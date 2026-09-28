@@ -1629,6 +1629,75 @@ where
         Ok(read)
     }
 
+    /// Read whole blocks of an open file straight into `blocks`.
+    ///
+    /// [`Self::read`] goes through the single-block cache, so however large
+    /// its buffer it asks the device for one block at a time, and on an SPI
+    /// card each of those is a command and a wait for the data token as well
+    /// as the block. This asks for each run of blocks that lie together on
+    /// the disk -- the rest of the current cluster, at most -- in one call,
+    /// which a device can answer with a single multi-block read.
+    ///
+    /// The file's position must be on a block boundary, or this refuses with
+    /// [`Error::InvalidOffset`] and reads nothing. Returns how many bytes of
+    /// the file were read: every block given is filled, and the last one
+    /// holds whatever the disk has past the end of the file, which is not
+    /// part of it. Fewer bytes than `blocks` can hold means the end of the
+    /// file.
+    ///
+    /// Bypassing the cache is safe because nothing is ever left in it
+    /// unwritten: [`BlockCache::write_back`] follows every modification
+    /// within the same operation.
+    pub fn read_blocks(
+        &self,
+        file: RawFile,
+        blocks: &mut [Block],
+    ) -> Result<usize, Error<D::Error>> {
+        let mut data = self.data.try_borrow_mut().map_err(|_| Error::LockError)?;
+        let data = data.deref_mut();
+
+        let file_idx = data.get_file_by_id(file)?;
+        let volume_idx = data.get_volume_by_id(data.open_files[file_idx].raw_volume)?;
+        if data.open_files[file_idx].current_offset % Block::LEN_U32 != 0 {
+            return Err(Error::InvalidOffset);
+        }
+        let bytes_per_cluster = match &data.open_volumes[volume_idx].volume_type {
+            VolumeType::Fat(fat) => fat.bytes_per_cluster(),
+        };
+
+        let mut filled = 0;
+        let mut read = 0;
+        while filled < blocks.len() && !data.open_files[file_idx].eof() {
+            let mut current_cluster = data.open_files[file_idx].current_cluster;
+            let offset = data.open_files[file_idx].current_offset;
+            let (block_idx, _, _) = data.find_data_on_disk(
+                volume_idx,
+                &mut current_cluster,
+                data.open_files[file_idx].entry.cluster,
+                offset,
+            )?;
+            data.open_files[file_idx].current_cluster = current_cluster;
+            let left_in_cluster =
+                ((bytes_per_cluster - (offset - current_cluster.0)) / Block::LEN_U32) as usize;
+            let left_in_file = data.open_files[file_idx].left() as usize;
+            let run = (blocks.len() - filled)
+                .min(left_in_cluster)
+                .min(left_in_file.div_ceil(Block::LEN));
+            trace!("Reading {} blocks of file ID {:?}", run, file);
+            data.block_cache
+                .block_device()
+                .read(&mut blocks[filled..filled + run], block_idx)
+                .map_err(Error::DeviceError)?;
+            let bytes = (run * Block::LEN).min(left_in_file);
+            filled += run;
+            read += bytes;
+            data.open_files[file_idx]
+                .seek_from_current(bytes as i32)
+                .unwrap();
+        }
+        Ok(read)
+    }
+
     /// Write to a open file.
     ///
     /// Endeavours to write the entire contents of the slice, stopping only if
