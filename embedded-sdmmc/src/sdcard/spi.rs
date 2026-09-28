@@ -208,16 +208,19 @@ where
             self.card_command(CmdId::CMD17_ReadSingleBlock, start_idx)?;
             self.read_data(&mut blocks[0].contents)?;
         } else {
-            // Start a multi-block read. A failure before the frame is on the
-            // wire has started nothing, and returns as it is.
-            self.send_command(CmdId::CMD18_ReadMultipleBlock, start_idx)?;
-            // From here the card may be streaming: once it takes CMD18 it
-            // sends blocks until told to stop, and a response that did not
-            // arrive says nothing about whether it took it. So every way out
+            // Start a multi-block read. A card that never became ready was
+            // sent nothing, and that failure returns as it is.
+            self.await_ready_for(CmdId::CMD18_ReadMultipleBlock)?;
+            // From the write on, the card may be streaming: once it takes
+            // CMD18 it sends blocks until told to stop, and neither a write
+            // that reports an error (the transaction can fail flushing or
+            // releasing chip select after the bytes went out) nor a response
+            // that did not arrive says whether it took it. So every way out
             // sends CMD12, or the next command would talk to a card still
             // sending the last one. The first error is the one reported.
             let mut data = self
-                .command_response(CmdId::CMD18_ReadMultipleBlock)
+                .write_command(CmdId::CMD18_ReadMultipleBlock, start_idx)
+                .and_then(|()| self.command_response(CmdId::CMD18_ReadMultipleBlock))
                 .map(|_| ());
             if data.is_ok() {
                 for block in blocks.iter_mut() {
@@ -504,17 +507,23 @@ where
 
     /// Perform a command.
     fn card_command(&mut self, command: CmdId, arg: u32) -> Result<u8, Error> {
-        self.send_command(command, arg)?;
+        self.await_ready_for(command)?;
+        self.write_command(command, arg)?;
         self.command_response(command)
     }
 
-    /// Put a command frame on the wire, once the card is ready for one. An
-    /// error here means the card was not sent the command.
-    fn send_command(&mut self, command: CmdId, arg: u32) -> Result<(), Error> {
+    /// Wait until the card will take a command. An error here means nothing
+    /// was sent.
+    fn await_ready_for(&mut self, command: CmdId) -> Result<(), Error> {
         if command != CmdId::CMD0_GoIdleState && command != CmdId::CMD12_StopTransmission {
             self.wait_not_busy(Delay::new_command())?;
         }
+        Ok(())
+    }
 
+    /// Put a command frame on the wire. An error here does not say the card
+    /// missed it: the SPI transaction can fail after its bytes went out.
+    fn write_command(&mut self, command: CmdId, arg: u32) -> Result<(), Error> {
         let mut buf = [
             0x40 | command as u8,
             (arg >> 24) as u8,
@@ -779,6 +788,9 @@ mod tests {
         glitch_armed: bool,
         /// Hold the data line low, as a card still busy with a write does.
         busy: bool,
+        /// Report the transaction carrying a CMD18 frame as failed after the
+        /// card took the frame, as a failed chip-select release would.
+        fail_cmd18_write: bool,
     }
 
     /// A transfer the bus reported as failed.
@@ -869,6 +881,9 @@ mod tests {
                     Operation::Write(bytes) => {
                         if bytes.len() == 6 && bytes[0] & 0xC0 == 0x40 {
                             self.command(bytes);
+                            if bytes[0] & 0x3F == 18 && self.fail_cmd18_write {
+                                return Err(Glitch);
+                            }
                         }
                     }
                     Operation::Transfer(read, _) => self.receive(read)?,
@@ -896,6 +911,7 @@ mod tests {
                 lose_cmd18_response: false,
                 glitch_armed: false,
                 busy: false,
+                fail_cmd18_write: false,
             },
             delayer: NoDelay,
             card_type: Some(CardType::SdhcSdxc),
@@ -971,5 +987,31 @@ mod tests {
             Err(Error::TimeoutWaitNotBusy)
         ));
         assert!(card.spi.commands.is_empty(), "{:?}", card.spi.commands);
+    }
+
+    /// The CMD18 frame reaches the card, which starts streaming, and then the
+    /// write's transaction reports a failure. The write's error says nothing
+    /// about whether the card took the command, so CMD12 still follows, the
+    /// write's error is the one reported, and the next read works.
+    #[test]
+    fn a_multi_block_read_whose_command_write_reports_failure_still_stops_the_card() {
+        let mut card = card(None);
+        card.spi.fail_cmd18_write = true;
+        let mut blocks = [Block::new(), Block::new()];
+        assert!(matches!(
+            card.read(&mut blocks, BlockIdx(40)),
+            Err(Error::Transport)
+        ));
+        assert_eq!(
+            card.spi.commands,
+            [18, 12],
+            "CMD12 follows the failed write"
+        );
+
+        card.spi.fail_cmd18_write = false;
+        let mut again = [Block::new()];
+        card.read(&mut again, BlockIdx(90))
+            .expect("the next read works");
+        assert_eq!(again[0].contents, ScriptedCard::block(90));
     }
 }
