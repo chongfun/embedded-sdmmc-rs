@@ -263,15 +263,32 @@ where
             // wait for card to be ready before sending the next command
             self.wait_not_busy(Delay::new_write())?;
 
-            // Start a multi-block write
-            self.card_command(CmdId::CMD25_WriteMultipleBlock, start_idx)?;
-            for block in blocks.iter() {
-                self.wait_not_busy(Delay::new_write())?;
-                self.write_data(WRITE_MULTIPLE_TOKEN, &block.contents)?;
+            // Start a multi-block write. As for the multi-block read, a card
+            // that never became ready was sent nothing; from the attempt to
+            // write CMD25 on, the card may be taking blocks, and only the
+            // stop token ends that. So every way out sends it, and the first
+            // error is the one reported.
+            self.await_ready_for(CmdId::CMD25_WriteMultipleBlock)?;
+            let mut data = self
+                .write_command(CmdId::CMD25_WriteMultipleBlock, start_idx)
+                .and_then(|()| self.command_response(CmdId::CMD25_WriteMultipleBlock))
+                .map(|_| ());
+            if data.is_ok() {
+                for block in blocks.iter() {
+                    data = self
+                        .wait_not_busy(Delay::new_write())
+                        .and_then(|()| self.write_data(WRITE_MULTIPLE_TOKEN, &block.contents));
+                    if data.is_err() {
+                        break;
+                    }
+                }
             }
             // Stop the write
-            self.wait_not_busy(Delay::new_write())?;
-            self.write_byte(STOP_TRAN_TOKEN)?;
+            let stopped = self
+                .wait_not_busy(Delay::new_write())
+                .and_then(|()| self.write_byte(STOP_TRAN_TOKEN));
+            data?;
+            stopped?;
         }
         Ok(())
     }
@@ -788,9 +805,17 @@ mod tests {
         glitch_armed: bool,
         /// Hold the data line low, as a card still busy with a write does.
         busy: bool,
-        /// Report the transaction carrying a CMD18 frame as failed after the
-        /// card took the frame, as a failed chip-select release would.
-        fail_cmd18_write: bool,
+        /// Report the transaction carrying this command's frame as failed
+        /// after the card took the frame, as a failed chip-select release
+        /// would.
+        fail_command_write: Option<u8>,
+        /// Taking blocks after CMD25, until the stop token.
+        writing: bool,
+        blocks_taken: usize,
+        /// The block of a multi-block write the card answers as rejected.
+        reject_block: Option<usize>,
+        /// Blocks the card accepted.
+        written: Vec<[u8; 512]>,
     }
 
     /// A transfer the bus reported as failed.
@@ -837,12 +862,42 @@ mod tests {
                         }
                     }
                 }
+                // CMD25: blocks are taken from here until the stop token.
+                25 => {
+                    self.outgoing.push_back(0x00);
+                    self.writing = true;
+                    self.blocks_taken = 0;
+                }
                 // CMD12: the stream stops; a stuff byte, then R1.
                 12 => {
                     self.outgoing.clear();
                     self.outgoing.extend([0xFF, 0x00]);
                 }
                 _ => self.outgoing.push_back(0x04),
+            }
+        }
+
+        /// Bytes the driver clocks out one at a time: the tokens of a write.
+        fn sent(&mut self, bytes: &[u8]) {
+            if !self.writing || bytes.len() != 1 {
+                return;
+            }
+            match bytes[0] {
+                // A block follows; its data response comes after the CRC.
+                WRITE_MULTIPLE_TOKEN => {
+                    let response = if Some(self.blocks_taken) == self.reject_block {
+                        0x0B
+                    } else {
+                        DATA_RES_ACCEPTED
+                    };
+                    self.outgoing.push_back(response);
+                    self.blocks_taken += 1;
+                }
+                STOP_TRAN_TOKEN => {
+                    self.writing = false;
+                    self.commands.push(STOP_TRAN_TOKEN);
+                }
+                _ => {}
             }
         }
 
@@ -881,12 +936,21 @@ mod tests {
                     Operation::Write(bytes) => {
                         if bytes.len() == 6 && bytes[0] & 0xC0 == 0x40 {
                             self.command(bytes);
-                            if bytes[0] & 0x3F == 18 && self.fail_cmd18_write {
+                            if Some(bytes[0] & 0x3F) == self.fail_command_write {
                                 return Err(Glitch);
+                            }
+                        } else if bytes.len() == 512 && self.writing {
+                            let mut block = [0u8; 512];
+                            block.copy_from_slice(bytes);
+                            if Some(self.blocks_taken) != self.reject_block {
+                                self.written.push(block);
                             }
                         }
                     }
-                    Operation::Transfer(read, _) => self.receive(read)?,
+                    Operation::Transfer(read, write) => {
+                        self.receive(read)?;
+                        self.sent(write);
+                    }
                     Operation::TransferInPlace(bytes) => self.receive(bytes)?,
                     Operation::Read(bytes) => self.receive(bytes)?,
                     Operation::DelayNs(_) => {}
@@ -911,7 +975,11 @@ mod tests {
                 lose_cmd18_response: false,
                 glitch_armed: false,
                 busy: false,
-                fail_cmd18_write: false,
+                fail_command_write: None,
+                writing: false,
+                blocks_taken: 0,
+                reject_block: None,
+                written: Vec::new(),
             },
             delayer: NoDelay,
             card_type: Some(CardType::SdhcSdxc),
@@ -996,7 +1064,7 @@ mod tests {
     #[test]
     fn a_multi_block_read_whose_command_write_reports_failure_still_stops_the_card() {
         let mut card = card(None);
-        card.spi.fail_cmd18_write = true;
+        card.spi.fail_command_write = Some(18);
         let mut blocks = [Block::new(), Block::new()];
         assert!(matches!(
             card.read(&mut blocks, BlockIdx(40)),
@@ -1008,10 +1076,61 @@ mod tests {
             "CMD12 follows the failed write"
         );
 
-        card.spi.fail_cmd18_write = false;
+        card.spi.fail_command_write = None;
         let mut again = [Block::new()];
         card.read(&mut again, BlockIdx(90))
             .expect("the next read works");
         assert_eq!(again[0].contents, ScriptedCard::block(90));
+    }
+
+    fn blocks(n: u32) -> Vec<Block> {
+        (0..n)
+            .map(|i| {
+                let mut block = Block::new();
+                block.contents = ScriptedCard::block(100 + i);
+                block
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_multi_block_write_sends_every_block_and_the_stop_token() {
+        let mut card = card(None);
+        card.write(&blocks(3), BlockIdx(40)).expect("write");
+        assert_eq!(card.spi.written.len(), 3);
+        assert_eq!(card.spi.commands, [55, 23, 25, STOP_TRAN_TOKEN]);
+    }
+
+    /// A block the card rejects part way still ends with the stop token, the
+    /// rejection is the error reported, and the next command finds a card
+    /// that is listening.
+    #[test]
+    fn a_multi_block_write_that_fails_part_way_still_sends_the_stop_token() {
+        let mut card = card(None);
+        card.spi.reject_block = Some(1);
+        assert!(matches!(
+            card.write(&blocks(3), BlockIdx(40)),
+            Err(Error::WriteError)
+        ));
+        assert_eq!(card.spi.commands, [55, 23, 25, STOP_TRAN_TOKEN]);
+        assert_eq!(card.spi.written.len(), 1, "the card took one block");
+
+        let mut again = [Block::new()];
+        card.read(&mut again, BlockIdx(90))
+            .expect("the next read works");
+        assert_eq!(again[0].contents, ScriptedCard::block(90));
+    }
+
+    /// The CMD25 frame reaches the card and the write reports failure: the
+    /// card may be taking blocks, so the stop token still follows.
+    #[test]
+    fn a_multi_block_write_whose_command_write_reports_failure_still_sends_the_stop_token() {
+        let mut card = card(None);
+        card.spi.fail_command_write = Some(25);
+        assert!(matches!(
+            card.write(&blocks(2), BlockIdx(40)),
+            Err(Error::Transport)
+        ));
+        assert_eq!(card.spi.commands, [55, 23, 25, STOP_TRAN_TOKEN]);
     }
 }

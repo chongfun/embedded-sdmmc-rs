@@ -35,6 +35,9 @@ The format is based on [Keep a Changelog] and this project adheres to [Semantic 
   bytes went out) nor a lost response says whether the card took it; the
   first error is still the one returned. A card too busy to be sent `CMD18`
   gets no `CMD12`.
+- A multi-block write on SPI that failed part way returned before the stop
+  token, leaving the card taking blocks. The token now follows once the
+  `CMD25` write has been attempted, and the first error is returned.
 
 ## [Version 0.10.0] - 2026-07-24
 
