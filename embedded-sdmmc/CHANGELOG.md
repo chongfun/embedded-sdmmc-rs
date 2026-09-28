@@ -25,8 +25,9 @@ The format is based on [Keep a Changelog] and this project adheres to [Semantic 
 
 - A multi-block read on SPI that failed part way returned before sending
   `CMD12`, leaving the card streaming blocks into whatever command came next.
-  The stop is now sent whenever `CMD18` was accepted; a data error is still
-  the one returned when both fail.
+  The stop is now sent once the `CMD18` frame is on the wire, including when
+  its response is lost, since the card may have taken it; the first error is
+  still the one returned. A card too busy to be sent `CMD18` gets no `CMD12`.
 
 ## [Version 0.10.0] - 2026-07-24
 

@@ -208,20 +208,25 @@ where
             self.card_command(CmdId::CMD17_ReadSingleBlock, start_idx)?;
             self.read_data(&mut blocks[0].contents)?;
         } else {
-            // Start a multi-block read
-            self.card_command(CmdId::CMD18_ReadMultipleBlock, start_idx)?;
-            let mut data = Ok(());
-            for block in blocks.iter_mut() {
-                data = self.read_data(&mut block.contents);
-                if data.is_err() {
-                    break;
+            // Start a multi-block read. A failure before the frame is on the
+            // wire has started nothing, and returns as it is.
+            self.send_command(CmdId::CMD18_ReadMultipleBlock, start_idx)?;
+            // From here the card may be streaming: once it takes CMD18 it
+            // sends blocks until told to stop, and a response that did not
+            // arrive says nothing about whether it took it. So every way out
+            // sends CMD12, or the next command would talk to a card still
+            // sending the last one. The first error is the one reported.
+            let mut data = self
+                .command_response(CmdId::CMD18_ReadMultipleBlock)
+                .map(|_| ());
+            if data.is_ok() {
+                for block in blocks.iter_mut() {
+                    data = self.read_data(&mut block.contents);
+                    if data.is_err() {
+                        break;
+                    }
                 }
             }
-            // Stop the read whatever became of the data. Once CMD18 is
-            // accepted the card streams blocks until it is told to stop, so a
-            // read that failed part way and returned without CMD12 would leave
-            // the next command talking to a card still sending the last one.
-            // The data's error is the one worth reporting when both fail.
             let stopped = self.card_command(CmdId::CMD12_StopTransmission, 0);
             data?;
             stopped?;
@@ -499,6 +504,13 @@ where
 
     /// Perform a command.
     fn card_command(&mut self, command: CmdId, arg: u32) -> Result<u8, Error> {
+        self.send_command(command, arg)?;
+        self.command_response(command)
+    }
+
+    /// Put a command frame on the wire, once the card is ready for one. An
+    /// error here means the card was not sent the command.
+    fn send_command(&mut self, command: CmdId, arg: u32) -> Result<(), Error> {
         if command != CmdId::CMD0_GoIdleState && command != CmdId::CMD12_StopTransmission {
             self.wait_not_busy(Delay::new_command())?;
         }
@@ -513,8 +525,12 @@ where
         ];
         buf[5] = (crc7(&buf[0..5]) << 1) | 1;
 
-        self.write_bytes(&buf)?;
+        self.write_bytes(&buf)
+    }
 
+    /// Wait for the R1 response to a command just sent. An error here leaves
+    /// open whether the card acted on it.
+    fn command_response(&mut self, command: CmdId) -> Result<u8, Error> {
         // skip stuff byte for stop read
         if command == CmdId::CMD12_StopTransmission {
             let _result = self.read_byte()?;
@@ -757,6 +773,22 @@ mod tests {
         commands: Vec<u8>,
         /// The block of a multi-block read that arrives with a bad token.
         fail_block: Option<usize>,
+        /// Fail the first read after a CMD18 frame, losing its response
+        /// while the card, having taken the command, streams on.
+        lose_cmd18_response: bool,
+        glitch_armed: bool,
+        /// Hold the data line low, as a card still busy with a write does.
+        busy: bool,
+    }
+
+    /// A transfer the bus reported as failed.
+    #[derive(Debug)]
+    struct Glitch;
+
+    impl embedded_hal::spi::Error for Glitch {
+        fn kind(&self) -> embedded_hal::spi::ErrorKind {
+            embedded_hal::spi::ErrorKind::Other
+        }
     }
 
     impl ScriptedCard {
@@ -782,6 +814,7 @@ mod tests {
                 }
                 // CMD18: blocks from `arg` on, more than any test reads.
                 18 => {
+                    self.glitch_armed = self.lose_cmd18_response;
                     self.outgoing.push_back(0x00);
                     for i in 0..8 {
                         if Some(i) == self.fail_block {
@@ -802,12 +835,27 @@ mod tests {
         }
 
         fn next(&mut self) -> u8 {
+            if self.busy {
+                return 0x00;
+            }
             self.outgoing.pop_front().unwrap_or(0xFF)
+        }
+
+        /// Clock `bytes` in from the card, unless a glitch is armed: then the
+        /// first byte is lost on the wire and the transfer fails.
+        fn receive(&mut self, bytes: &mut [u8]) -> Result<(), Glitch> {
+            if self.glitch_armed {
+                self.glitch_armed = false;
+                let _ = self.next();
+                return Err(Glitch);
+            }
+            bytes.iter_mut().for_each(|b| *b = self.next());
+            Ok(())
         }
     }
 
     impl embedded_hal::spi::ErrorType for ScriptedCard {
-        type Error = core::convert::Infallible;
+        type Error = Glitch;
     }
 
     impl embedded_hal::spi::SpiDevice<u8> for ScriptedCard {
@@ -823,11 +871,9 @@ mod tests {
                             self.command(bytes);
                         }
                     }
-                    Operation::Transfer(read, _) => read.iter_mut().for_each(|b| *b = self.next()),
-                    Operation::TransferInPlace(bytes) => {
-                        bytes.iter_mut().for_each(|b| *b = self.next())
-                    }
-                    Operation::Read(bytes) => bytes.iter_mut().for_each(|b| *b = self.next()),
+                    Operation::Transfer(read, _) => self.receive(read)?,
+                    Operation::TransferInPlace(bytes) => self.receive(bytes)?,
+                    Operation::Read(bytes) => self.receive(bytes)?,
                     Operation::DelayNs(_) => {}
                 }
             }
@@ -847,6 +893,9 @@ mod tests {
                 outgoing: VecDeque::new(),
                 commands: Vec::new(),
                 fail_block,
+                lose_cmd18_response: false,
+                glitch_armed: false,
+                busy: false,
             },
             delayer: NoDelay,
             card_type: Some(CardType::SdhcSdxc),
@@ -884,5 +933,43 @@ mod tests {
         card.read(&mut again, BlockIdx(90))
             .expect("the next read works");
         assert_eq!(again[0].contents, ScriptedCard::block(90));
+    }
+
+    /// The CMD18 frame goes out and its response is lost on the wire. The
+    /// card took the command and is streaming, so CMD12 still follows, the
+    /// response's error is the one reported, and the next read works.
+    #[test]
+    fn a_multi_block_read_whose_response_is_lost_still_stops_the_card() {
+        let mut card = card(None);
+        card.spi.lose_cmd18_response = true;
+        let mut blocks = [Block::new(), Block::new()];
+        assert!(matches!(
+            card.read(&mut blocks, BlockIdx(40)),
+            Err(Error::Transport)
+        ));
+        assert_eq!(
+            card.spi.commands,
+            [18, 12],
+            "CMD12 follows the lost response"
+        );
+
+        let mut again = [Block::new()];
+        card.read(&mut again, BlockIdx(90))
+            .expect("the next read works");
+        assert_eq!(again[0].contents, ScriptedCard::block(90));
+    }
+
+    /// A card that stays busy is never sent CMD18, so there is no stream to
+    /// stop and no CMD12 goes after it.
+    #[test]
+    fn a_multi_block_read_the_card_was_too_busy_for_sends_nothing() {
+        let mut card = card(None);
+        card.spi.busy = true;
+        let mut blocks = [Block::new(), Block::new()];
+        assert!(matches!(
+            card.read(&mut blocks, BlockIdx(40)),
+            Err(Error::TimeoutWaitNotBusy)
+        ));
+        assert!(card.spi.commands.is_empty(), "{:?}", card.spi.commands);
     }
 }
