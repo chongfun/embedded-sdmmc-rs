@@ -23,6 +23,11 @@ The format is based on [Keep a Changelog] and this project adheres to [Semantic 
 
 ### Fixed
 
+- `truncate_cluster_chain` did not count the last cluster it freed, so every
+  truncation left the free-cluster count one short, and allocation then
+  decremented a count of zero while the FAT scan still found space: a panic
+  with overflow checks, a wrap to `u32::MAX` without. Every freed cluster now
+  counts, and allocation stops the count at zero.
 - A multi-block read on SPI that failed part way returned before sending
   `CMD12`, leaving the card streaming blocks into whatever command came next.
   The stop is now sent once the `CMD18` write has been attempted, since

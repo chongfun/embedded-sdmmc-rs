@@ -1943,9 +1943,12 @@ impl FatVolume {
                 Err(_) => None,
             };
         debug!("Next free cluster is {:?}", self.next_free_cluster);
-        // Record that we've allocated a cluster
+        // Record that we've allocated a cluster. The count can already read
+        // zero with a cluster free: it is kept pessimistic on purpose where a
+        // write it depends on may not have landed, and the scan above, not
+        // the count, is what decides there is space. So it stops at zero.
         if let Some(ref mut number_free_cluster) = self.free_clusters_count {
-            *number_free_cluster -= 1;
+            *number_free_cluster = number_free_cluster.saturating_sub(1);
         };
         if zero {
             let start_block_idx = self.cluster_to_block(new_cluster);
@@ -2091,20 +2094,20 @@ impl FatVolume {
         }
         self.update_fat(block_cache, cluster, ClusterId::END_OF_FILE)?;
         loop {
-            match self.next_cluster(block_cache, next) {
-                Ok(n) => {
-                    self.update_fat(block_cache, next, ClusterId::EMPTY)?;
-                    next = n;
-                }
-                Err(Error::EndOfFile) => {
-                    self.update_fat(block_cache, next, ClusterId::EMPTY)?;
-                    break;
-                }
+            let after = match self.next_cluster(block_cache, next) {
+                Ok(n) => Some(n),
+                Err(Error::EndOfFile) => None,
                 Err(e) => return Err(e),
-            }
-            if let Some(ref mut number_free_cluster) = self.free_clusters_count {
-                *number_free_cluster += 1;
             };
+            self.update_fat(block_cache, next, ClusterId::EMPTY)?;
+            // Every cluster freed counts, the last one included.
+            if let Some(ref mut number_free_cluster) = self.free_clusters_count {
+                *number_free_cluster = number_free_cluster.saturating_add(1);
+            };
+            match after {
+                Some(n) => next = n,
+                None => break,
+            }
         }
         Ok(())
     }
