@@ -910,13 +910,12 @@ where
             )?,
         };
 
-        let cluster = data.open_dirs[directory_idx].cluster;
         let att = Attributes::create_from_fat(Attributes::DIRECTORY);
         match &mut data.open_volumes[volume_idx].volume_type {
             VolumeType::Fat(fat) => fat.make_dir(
                 &mut data.block_cache,
                 &self.time_source,
-                cluster,
+                &data.open_dirs[directory_idx],
                 sfn,
                 Some(long_name),
                 att,
@@ -2086,7 +2085,7 @@ where
                 fat.make_dir(
                     &mut data.block_cache,
                     &self.time_source,
-                    parent_directory_info.cluster,
+                    parent_directory_info,
                     sfn,
                     None,
                     att,

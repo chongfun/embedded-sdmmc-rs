@@ -1456,3 +1456,106 @@ fn a_directory_that_fails_while_being_laid_out_frees_its_cluster() {
     volume_mgr.close_dir(root).unwrap();
     volume_mgr.close_volume(volume).unwrap();
 }
+
+/// Make a folder on the FAT32 volume over a device whose write of the
+/// folder's short entry in the root lands and then reports an error, the way
+/// an SD card can take a sector and fail the status read after it. `blind`
+/// also stops reads of the root from then on. Returns what make_dir said,
+/// the folder's cluster as the disk has it, and the cluster the next folder
+/// made is given.
+fn make_dir_whose_name_lands_then_fails(
+    long: bool,
+    blind: bool,
+) -> (bool, embedded_sdmmc::ClusterId, embedded_sdmmc::ClusterId) {
+    let device =
+        utils::FailRegion::new(utils::make_block_device(utils::DISK_SOURCE).expect("disk image"));
+    let volume_mgr = embedded_sdmmc::VolumeManager::new(device, utils::make_time_source());
+    let volume = volume_mgr
+        .open_raw_volume(embedded_sdmmc::VolumeIdx(1))
+        .expect("open volume");
+    let root = volume_mgr.open_root_dir(volume).expect("open root");
+
+    // Learn where the root's entries go: a probe file lands where the folder
+    // will, in the same cluster.
+    let probe = volume_mgr
+        .open_file_in_dir(root, "PROBE.TXT", embedded_sdmmc::Mode::ReadWriteCreate)
+        .expect("probe");
+    volume_mgr.close_file(probe).expect("close probe");
+    let block = volume_mgr
+        .find_directory_entry(root, "PROBE.TXT")
+        .expect("probe entry")
+        .entry_block
+        .0;
+    let cluster_start = block - (block % 8);
+    // The long name is one long-name slot and then the short entry; the
+    // short name is the short entry alone. The short entry is the commit.
+    let short_entry_write = if long { 2 } else { 1 };
+    volume_mgr.device(|d| {
+        d.write_region.set(Some((cluster_start, cluster_start + 8)));
+        d.fail_write_number.set(Some(short_entry_write));
+        d.land_before_failing.set(true);
+        d.blind_after_failing.set(blind);
+    });
+    let attempt = if long {
+        volume_mgr.make_dir_in_dir_lfn(root, "Kept Folder")
+    } else {
+        volume_mgr.make_dir_in_dir(root, "KEPT")
+    };
+    volume_mgr.device(|d| {
+        d.write_region.set(None);
+        d.region.set(None);
+        d.fail_write_number.set(None);
+    });
+    assert!(
+        volume_mgr.device(|d| d.injected.get()) >= 1,
+        "no write was intercepted, so this proves nothing"
+    );
+
+    let name = if long { "KEPTFO~1" } else { "KEPT" };
+    let kept = volume_mgr
+        .find_directory_entry(root, name)
+        .expect("the folder's name landed")
+        .cluster;
+    // The folder is whole behind its name.
+    let folder = volume_mgr.open_dir(root, name).expect("open the folder");
+    volume_mgr.close_dir(folder).expect("close the folder");
+
+    volume_mgr
+        .make_dir_in_dir(root, "NEXT")
+        .expect("make the next folder");
+    let next = volume_mgr
+        .find_directory_entry(root, "NEXT")
+        .expect("next folder")
+        .cluster;
+    volume_mgr.close_dir(root).unwrap();
+    volume_mgr.close_volume(volume).unwrap();
+    (attempt.is_ok(), kept, next)
+}
+
+/// The name landed, so the folder exists: make_dir reports success and keeps
+/// the cluster, which the next allocation must not be handed.
+#[test]
+fn a_directory_whose_name_landed_despite_an_error_keeps_its_cluster() {
+    for long in [true, false] {
+        let (ok, kept, next) = make_dir_whose_name_lands_then_fails(long, false);
+        assert!(ok, "long={long}: the folder was made");
+        assert_ne!(
+            kept, next,
+            "long={long}: a live folder's cluster was handed out again"
+        );
+    }
+}
+
+/// Whether the name landed cannot be learned: make_dir reports the error and
+/// leaks the cluster rather than free one the parent may name.
+#[test]
+fn a_directory_that_cannot_tell_whether_its_name_landed_keeps_its_cluster() {
+    for long in [true, false] {
+        let (ok, kept, next) = make_dir_whose_name_lands_then_fails(long, true);
+        assert!(!ok, "long={long}: the error is reported");
+        assert_ne!(
+            kept, next,
+            "long={long}: a live folder's cluster was handed out again"
+        );
+    }
+}

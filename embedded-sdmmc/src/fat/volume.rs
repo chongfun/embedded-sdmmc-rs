@@ -436,6 +436,22 @@ where
     block_cache.write_back().map_err(Error::DeviceError)
 }
 
+/// Whether a directory slot holds exactly `raw`, read from the disk. After a
+/// failed write the cache has already dropped the sector, so this is the
+/// disk's answer and not the cache's.
+fn directory_slot_holds<D>(
+    block_cache: &mut BlockCache<D>,
+    slot: DirectorySlot,
+    raw: &[u8; 32],
+) -> Result<bool, Error<D::Error>>
+where
+    D: BlockDevice,
+{
+    let block = block_cache.read(slot.block).map_err(Error::DeviceError)?;
+    let start = usize::try_from(slot.offset).map_err(|_| Error::ConversionError)?;
+    Ok(block[start..start + OnDiskDirEntry::LEN] == raw[..])
+}
+
 /// Retire a directory entry by marking each of its slots deleted.
 ///
 /// `slots` arrives as it sits on the disk: the long-name entries first, then
@@ -1036,7 +1052,9 @@ impl FatVolume {
                 &utf16[start..end],
             );
             if let Err(error) = write_directory_slot(block_cache, slots[disk_index], &raw) {
-                let _ = mark_directory_slots_deleted(block_cache, &slots[..written]);
+                // The failed slot may have landed; retire it with the rest,
+                // so no stray long name is left to attach to a later entry.
+                let _ = mark_directory_slots_deleted(block_cache, &slots[..=written]);
                 return Err(error);
             }
             written += 1;
@@ -1055,8 +1073,21 @@ impl FatVolume {
         entry.size = size;
         let raw = entry.serialize(self.get_fat_type());
         if let Err(error) = write_directory_slot(block_cache, short_slot, &raw) {
-            let _ = mark_directory_slots_deleted(block_cache, &slots[..written]);
-            return Err(error);
+            // The short entry is the commit, and an error writing it does not
+            // mean it did not land. Read it back before undoing anything:
+            // retiring the long name of an entry that did land leaves the
+            // file answering only to its alias.
+            return match directory_slot_holds(block_cache, short_slot, &raw) {
+                Ok(true) => Ok(entry),
+                Ok(false) => {
+                    let _ = mark_directory_slots_deleted(block_cache, &slots[..written]);
+                    Err(error)
+                }
+                // Long-name slots with no short entry after them are ignored
+                // by every reader; ones taken from an entry that is there are
+                // not. Leave them.
+                Err(_) => Err(error),
+            };
         }
         Ok(entry)
     }
@@ -2155,7 +2186,7 @@ impl FatVolume {
         &mut self,
         block_cache: &mut BlockCache<D>,
         time_source: &T,
-        parent: ClusterId,
+        parent: &DirectoryInfo,
         sfn: ShortFileName,
         long_name: Option<&str>,
         att: Attributes,
@@ -2170,52 +2201,71 @@ impl FatVolume {
         // whose stored cluster is zero -- which is read back as the root
         // directory, so a folder that could not be created appears on the card
         // claiming to be the root.
-        //
-        // Nothing between the allocation and the end of this is reachable by
-        // any name, so if any part of it fails the cluster is handed back.
+        let now = time_source.get_timestamp();
         let new_cluster = self.alloc_cluster(block_cache, None, false)?;
-        match self.build_and_publish_dir(
-            block_cache,
-            time_source,
-            parent,
-            sfn,
-            long_name,
-            att,
-            new_cluster,
-        ) {
+        // Nothing names the cluster yet, so a failure here hands it back.
+        if let Err(error) = self.build_dir(block_cache, parent.cluster, att, new_cluster, now) {
+            self.release_unpublished_cluster(block_cache, new_cluster);
+            return Err(error);
+        }
+        let published = match long_name {
+            Some(long_name) => self.write_directory_entry_lfn(
+                block_cache,
+                parent.cluster,
+                long_name,
+                sfn,
+                att,
+                new_cluster,
+                0,
+                now,
+                now,
+            ),
+            None => self.write_new_directory_entry(
+                block_cache,
+                time_source,
+                parent.cluster,
+                sfn,
+                att,
+                new_cluster,
+            ),
+        };
+        match published {
             Ok(entry) => {
                 debug!("Made new dir entry {:?}", entry);
                 Ok(())
             }
-            Err(error) => {
-                self.release_unpublished_cluster(block_cache, new_cluster);
-                Err(error)
-            }
+            // An error from publishing is not proof the name did not land: an
+            // SD card can take the sector and fail the status read after it.
+            // Freeing a cluster the parent does name hands a live directory's
+            // cluster to the next allocation, so the parent is asked first.
+            Err(error) => match self.names_cluster(block_cache, parent, new_cluster) {
+                // The name landed, and the directory is complete behind it.
+                Ok(true) => Ok(()),
+                Ok(false) => {
+                    self.release_unpublished_cluster(block_cache, new_cluster);
+                    Err(error)
+                }
+                // Unanswerable: a leaked cluster costs space, a freed live
+                // one costs the directory.
+                Err(_) => Err(error),
+            },
         }
     }
 
-    /// Lay out a freshly allocated directory cluster and then name it in its
-    /// parent.
-    ///
-    /// Every failure in here is one the caller undoes the same way, by
-    /// releasing the cluster, which is why none of it is split out.
-    #[allow(clippy::too_many_arguments)]
-    fn build_and_publish_dir<D, T>(
+    /// Lay out a freshly allocated directory cluster: `.` and `..`, then the
+    /// rest of the cluster blank.
+    fn build_dir<D>(
         &mut self,
         block_cache: &mut BlockCache<D>,
-        time_source: &T,
         parent: ClusterId,
-        sfn: ShortFileName,
-        long_name: Option<&str>,
         att: Attributes,
         new_cluster: ClusterId,
-    ) -> Result<DirEntry, Error<D::Error>>
+        now: Timestamp,
+    ) -> Result<(), Error<D::Error>>
     where
         D: BlockDevice,
-        T: TimeSource,
     {
         let new_dir_start_block = self.cluster_to_block(new_cluster);
-        let now = time_source.get_timestamp();
         let fat_type = self.get_fat_type();
         // A blank block
         let block = block_cache.blank_mut(new_dir_start_block);
@@ -2266,33 +2316,29 @@ impl FatVolume {
             let _block = block_cache.blank_mut(block_idx);
             block_cache.write_back()?;
         }
+        Ok(())
+    }
 
-        // The directory is complete; give it its name. Nothing up to here is
-        // reachable by any name, so whatever happens the card is left as it
-        // was apart from the cluster -- which the caller releases on any Err
-        // out of this function.
-        match long_name {
-            Some(long_name) => self.write_directory_entry_lfn(
-                block_cache,
-                parent,
-                long_name,
-                sfn,
-                att,
-                new_cluster,
-                0,
-                now,
-                now,
-            ),
-            None => self.write_new_directory_entry(
-                block_cache,
-                time_source,
-                parent,
-                sfn,
-                att,
-                new_cluster,
-            ),
-        }
-
+    /// Whether any live entry in `parent` starts at `cluster`.
+    fn names_cluster<D>(
+        &self,
+        block_cache: &mut BlockCache<D>,
+        parent: &DirectoryInfo,
+        cluster: ClusterId,
+    ) -> Result<bool, Error<D::Error>>
+    where
+        D: BlockDevice,
+    {
+        let mut named = false;
+        self.iterate_dir(block_cache, parent, |entry| {
+            if entry.cluster == cluster && !entry.attributes.is_lfn() {
+                named = true;
+                ControlFlow::Break(())
+            } else {
+                ControlFlow::Continue(())
+            }
+        })?;
+        Ok(named)
     }
 
     /// Hand back a cluster that was allocated but never named.

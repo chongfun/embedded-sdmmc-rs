@@ -45,6 +45,15 @@ The format is based on [Keep a Changelog] and this project adheres to [Semantic 
   chain. Both moves now look for the source again first: still there, the
   destination is undone as before; gone, the move completed and returns
   `Ok`; unanswerable, the destination stays and the error is returned.
+- Making a directory freed its cluster on any error publishing the name, and
+  the long-name writer retired its long-name slots on any error writing the
+  short entry. Both assumed the failed write had not landed. If it had, the
+  first left a live directory naming a free cluster, handed to the next
+  allocation, and the second left the file answering only to its alias.
+  make_dir now asks the parent before freeing: named, the directory is made
+  and returns `Ok`; not named, the cluster is freed; unanswerable, it leaks.
+  The long-name writer reads the short entry back before cleaning up, and
+  retires a long-name slot whose own write failed along with the rest.
 
 ## [Version 0.10.0] - 2026-07-24
 
