@@ -21,6 +21,13 @@ The format is based on [Keep a Changelog] and this project adheres to [Semantic 
   whatever its buffer size, which on an SPI card is a command and a token
   wait per block. The position must be on a block boundary.
 
+### Fixed
+
+- A multi-block read on SPI that failed part way returned before sending
+  `CMD12`, leaving the card streaming blocks into whatever command came next.
+  The stop is now sent whenever `CMD18` was accepted; a data error is still
+  the one returned when both fail.
+
 ## [Version 0.10.0] - 2026-07-24
 
 ### Changed

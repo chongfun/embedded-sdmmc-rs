@@ -210,11 +210,21 @@ where
         } else {
             // Start a multi-block read
             self.card_command(CmdId::CMD18_ReadMultipleBlock, start_idx)?;
+            let mut data = Ok(());
             for block in blocks.iter_mut() {
-                self.read_data(&mut block.contents)?;
+                data = self.read_data(&mut block.contents);
+                if data.is_err() {
+                    break;
+                }
             }
-            // Stop the read
-            self.card_command(CmdId::CMD12_StopTransmission, 0)?;
+            // Stop the read whatever became of the data. Once CMD18 is
+            // accepted the card streams blocks until it is told to stop, so a
+            // read that failed part way and returned without CMD12 would leave
+            // the next command talking to a card still sending the last one.
+            // The data's error is the one worth reporting when both fail.
+            let stopped = self.card_command(CmdId::CMD12_StopTransmission, 0);
+            data?;
+            stopped?;
         }
         Ok(())
     }
@@ -733,3 +743,146 @@ impl Delay {
 // End Of File
 //
 // ****************************************************************************
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::VecDeque;
+
+    /// Enough of an SD card on SPI to answer a single- or multi-block read.
+    /// After CMD18 it streams blocks until CMD12, as a card does, so bytes a
+    /// driver leaves unread are still waiting for whatever it sends next.
+    struct ScriptedCard {
+        outgoing: VecDeque<u8>,
+        commands: Vec<u8>,
+        /// The block of a multi-block read that arrives with a bad token.
+        fail_block: Option<usize>,
+    }
+
+    impl ScriptedCard {
+        fn block(n: u32) -> [u8; 512] {
+            core::array::from_fn(|i| (n as usize * 7 + i) as u8)
+        }
+
+        fn queue_block(&mut self, n: u32) {
+            self.outgoing.push_back(DATA_START_BLOCK);
+            self.outgoing.extend(Self::block(n));
+            self.outgoing.extend([0, 0]);
+        }
+
+        fn command(&mut self, frame: &[u8]) {
+            let command = frame[0] & 0x3F;
+            let arg = u32::from_be_bytes([frame[1], frame[2], frame[3], frame[4]]);
+            self.commands.push(command);
+            match command {
+                // CMD17: one block.
+                17 => {
+                    self.outgoing.push_back(0x00);
+                    self.queue_block(arg);
+                }
+                // CMD18: blocks from `arg` on, more than any test reads.
+                18 => {
+                    self.outgoing.push_back(0x00);
+                    for i in 0..8 {
+                        if Some(i) == self.fail_block {
+                            // A data error token instead of a block.
+                            self.outgoing.push_back(0x0B);
+                        } else {
+                            self.queue_block(arg + i as u32);
+                        }
+                    }
+                }
+                // CMD12: the stream stops; a stuff byte, then R1.
+                12 => {
+                    self.outgoing.clear();
+                    self.outgoing.extend([0xFF, 0x00]);
+                }
+                _ => self.outgoing.push_back(0x04),
+            }
+        }
+
+        fn next(&mut self) -> u8 {
+            self.outgoing.pop_front().unwrap_or(0xFF)
+        }
+    }
+
+    impl embedded_hal::spi::ErrorType for ScriptedCard {
+        type Error = core::convert::Infallible;
+    }
+
+    impl embedded_hal::spi::SpiDevice<u8> for ScriptedCard {
+        fn transaction(
+            &mut self,
+            operations: &mut [embedded_hal::spi::Operation<'_, u8>],
+        ) -> Result<(), Self::Error> {
+            use embedded_hal::spi::Operation;
+            for operation in operations {
+                match operation {
+                    Operation::Write(bytes) => {
+                        if bytes.len() == 6 && bytes[0] & 0xC0 == 0x40 {
+                            self.command(bytes);
+                        }
+                    }
+                    Operation::Transfer(read, _) => read.iter_mut().for_each(|b| *b = self.next()),
+                    Operation::TransferInPlace(bytes) => {
+                        bytes.iter_mut().for_each(|b| *b = self.next())
+                    }
+                    Operation::Read(bytes) => bytes.iter_mut().for_each(|b| *b = self.next()),
+                    Operation::DelayNs(_) => {}
+                }
+            }
+            Ok(())
+        }
+    }
+
+    struct NoDelay;
+
+    impl embedded_hal::delay::DelayNs for NoDelay {
+        fn delay_ns(&mut self, _ns: u32) {}
+    }
+
+    fn card(fail_block: Option<usize>) -> SdCardInner<ScriptedCard, NoDelay> {
+        SdCardInner {
+            spi: ScriptedCard {
+                outgoing: VecDeque::new(),
+                commands: Vec::new(),
+                fail_block,
+            },
+            delayer: NoDelay,
+            card_type: Some(CardType::SdhcSdxc),
+            options: AcquireOpts {
+                use_crc: false,
+                acquire_retries: 1,
+            },
+        }
+    }
+
+    #[test]
+    fn a_multi_block_read_reads_every_block_and_stops_the_card() {
+        let mut card = card(None);
+        let mut blocks = [Block::new(), Block::new(), Block::new()];
+        card.read(&mut blocks, BlockIdx(40)).expect("read");
+        for (i, block) in blocks.iter().enumerate() {
+            assert_eq!(block.contents, ScriptedCard::block(40 + i as u32));
+        }
+        assert_eq!(card.spi.commands, [18, 12]);
+    }
+
+    /// A block that fails part way still stops the card, the data's error is
+    /// the one reported, and the next command finds a card that is listening.
+    #[test]
+    fn a_multi_block_read_that_fails_part_way_still_stops_the_card() {
+        let mut card = card(Some(1));
+        let mut blocks = [Block::new(), Block::new(), Block::new()];
+        assert!(matches!(
+            card.read(&mut blocks, BlockIdx(40)),
+            Err(Error::ReadError)
+        ));
+        assert_eq!(card.spi.commands, [18, 12], "CMD12 follows the failure");
+
+        let mut again = [Block::new()];
+        card.read(&mut again, BlockIdx(90))
+            .expect("the next read works");
+        assert_eq!(again[0].contents, ScriptedCard::block(90));
+    }
+}
