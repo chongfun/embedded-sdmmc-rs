@@ -1411,7 +1411,7 @@ where
     /// writes the new entries into free slots, and a last walk of the source
     /// unlinks the old ones. Writes go two per destination block filled and
     /// one per source block touched, so a batch whose entries share a block
-    /// costs three writes.
+    /// costs three writes, where a single move costs three per name.
     ///
     /// Every new entry is written before any source is unlinked, so a crash
     /// or an error leaves each name under its old name, its new name, or both
@@ -1419,7 +1419,8 @@ where
     /// card took only part of, too: each destination block is written first
     /// with its new entries whole but marked free, then once more to unmark
     /// them, so a reader of a torn sector sees a free slot or a whole entry
-    /// and not a name over another file's cluster. That is the state a cut
+    /// and not a name over another file's cluster. [`Self::move_file_in_dir`]
+    /// writes its one entry the same way. That is the state a cut
     /// [`Self::move_file_in_dir`] leaves, recovered the same way: unlink the
     /// name you do not want with [`Self::delete_entry_in_dir`]. Unlike the
     /// single move, a failed batch does not undo its links, because a caller

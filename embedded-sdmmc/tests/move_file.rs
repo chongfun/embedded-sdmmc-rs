@@ -840,7 +840,7 @@ fn a_short_named_link_carries_the_sources_chain_and_size() {
     assert_eq!(read_all(&root, "S000.BIN"), vec![9u8; 1500]);
 }
 
-/// The short move has two writes and the same window between them as the
+/// The short move links in two writes and unlinks in one, with the same window as the
 /// long one. Cutting in at the second stops the unlink and the undo, both
 /// names remain, and unlinking the one not wanted recovers it.
 #[test]
@@ -860,14 +860,14 @@ fn a_short_named_move_interrupted_between_its_two_writes_is_recoverable() {
     staged.close().expect("close");
 
     // Source and destination share a directory, so every write lands in one
-    // cluster and can be counted. A short move is two writes: one installs
-    // the new entry, one retires the old. Cutting in at the second stops the
+    // cluster and can be counted. A short move is three writes: two install
+    // the new entry, one retires the old. Cutting in at the third stops the
     // move between its halves, and stops the undo as well.
     let entry = root.find_directory_entry("STAGED.TMP").expect("entry");
     let dir_block = entry.entry_block.0;
     let cluster_start = dir_block - (dir_block % 8);
     manager.device(|d| d.write_region.set(Some((cluster_start, cluster_start + 8))));
-    manager.device(|d| d.fail_writes_from.set(Some(2)));
+    manager.device(|d| d.fail_writes_from.set(Some(3)));
     let attempt = root.move_file_in_dir("STAGED.TMP", &root, "BOOK.BIN");
     manager.device(|d| d.fail_writes_from.set(None));
     manager.device(|d| d.write_region.set(None));
@@ -1449,6 +1449,140 @@ fn a_batched_move_torn_inside_any_sector_leaves_every_file_a_name() {
     );
 }
 
+/// The single short move's link, torn at every byte it changes as a sector
+/// the card took only the front of, then power loss. The destination lists
+/// the file whole on its own chain or not at all, the file keeps a name, and
+/// the retry finishes.
+#[test]
+fn a_short_move_torn_inside_its_sector_leaves_the_file_a_name() {
+    let device =
+        utils::FailRegion::new(utils::make_block_device(utils::DISK_SOURCE).expect("disk"));
+    let mut manager: FaultyManager =
+        VolumeManager::new_with_limits(device, utils::make_time_source(), 0xAA);
+    let cluster;
+    {
+        let volume = manager.open_volume(VolumeIdx(1)).expect("volume");
+        let root = volume.open_root_dir().expect("root");
+        root.make_dir_in_dir("FROM").expect("make FROM");
+        root.make_dir_in_dir("TO").expect("make TO");
+        let from = root.open_dir("FROM").expect("FROM");
+        let file = from
+            .open_file_in_dir("BOOK.BIN", Mode::ReadWriteCreate)
+            .expect("create");
+        file.write(b"the index").expect("write");
+        file.close().expect("close");
+        cluster = from
+            .find_directory_entry("BOOK.BIN")
+            .expect("entry")
+            .cluster;
+    }
+
+    manager.device(|d| {
+        d.write_region.set(Some((0, u32::MAX)));
+        d.writes_seen.set(0);
+        d.fail_writes_from.set(Some(u32::MAX));
+        d.log_changes.set(true);
+        *d.undo.borrow_mut() = Some(Vec::new());
+    });
+    {
+        let volume = manager.open_volume(VolumeIdx(1)).expect("volume");
+        let root = volume.open_root_dir().expect("root");
+        let from = root.open_dir("FROM").expect("FROM");
+        let to = root.open_dir("TO").expect("TO");
+        from.move_file_in_dir("BOOK.BIN", &to, "BOOK.BIN")
+            .expect("clean move");
+        manager.device(|d| {
+            d.log_changes.set(false);
+            d.fail_writes_from.set(None);
+            d.write_region.set(None);
+        });
+    }
+    let (device, time) = manager.free();
+    device.restore().expect("restore");
+    let changes = device.changes.replace(Vec::new());
+    manager = VolumeManager::new_with_limits(device, time, 0xAA);
+    assert_eq!(changes.len(), 3, "a link of two writes and an unlink");
+
+    let mut twins_seen = 0;
+    for (write, changed) in changes.iter().enumerate() {
+        let number = write as u32 + 1;
+        let mut cuts = vec![0];
+        cuts.extend(changed.iter().map(|b| b + 1));
+        for cut in cuts {
+            manager.device(|d| {
+                d.write_region.set(Some((0, u32::MAX)));
+                d.writes_seen.set(0);
+                d.injected.set(0);
+                d.fail_writes_from.set(Some(number));
+                d.land_before_failing.set(true);
+                d.land_bytes_before_failing.set(Some(cut));
+                *d.undo.borrow_mut() = Some(Vec::new());
+            });
+            {
+                let volume = manager.open_volume(VolumeIdx(1)).expect("volume");
+                let root = volume.open_root_dir().expect("root");
+                let from = root.open_dir("FROM").expect("FROM");
+                let to = root.open_dir("TO").expect("TO");
+                // A torn unlink whose mark landed is a move that happened,
+                // and the move looks before saying otherwise, so the attempt
+                // may report success.
+                let _ = from.move_file_in_dir("BOOK.BIN", &to, "BOOK.BIN");
+                assert!(
+                    manager.device(|d| d.injected.get()) > 0,
+                    "write {number} cut {cut}: fewer writes than the clean run"
+                );
+                manager.device(|d| {
+                    d.fail_writes_from.set(None);
+                    d.land_before_failing.set(false);
+                    d.land_bytes_before_failing.set(None);
+                    d.write_region.set(None);
+                });
+
+                to.iterate_dir(|entry| {
+                    let name = entry.name.to_string();
+                    if name != "." && name != ".." {
+                        assert_eq!(
+                            name, "BOOK.BIN",
+                            "write {number} cut {cut}: TO lists {name:?}"
+                        );
+                        assert_eq!(entry.cluster, cluster, "write {number} cut {cut}");
+                        assert_eq!(entry.size, 9, "write {number} cut {cut}");
+                    }
+                    ControlFlow::Continue(())
+                })
+                .expect("list TO");
+                let old = from.find_directory_entry("BOOK.BIN").ok();
+                let new = to.find_directory_entry("BOOK.BIN").ok();
+                match (old, new) {
+                    (None, None) => {
+                        panic!("write {number} cut {cut}: the file lost every name")
+                    }
+                    (Some(old), Some(new)) => {
+                        assert_eq!(old.cluster, new.cluster, "write {number} cut {cut}");
+                        twins_seen += 1;
+                        from.delete_entry_in_dir("BOOK.BIN").expect("recover");
+                    }
+                    (Some(old), None) => {
+                        assert_eq!(old.cluster, cluster);
+                        from.move_file_in_dir("BOOK.BIN", &to, "BOOK.BIN")
+                            .expect("retry");
+                    }
+                    (None, Some(new)) => assert_eq!(new.cluster, cluster),
+                }
+                assert_eq!(
+                    read_all(&to, "BOOK.BIN"),
+                    b"the index",
+                    "write {number} cut {cut}"
+                );
+            }
+            let (device, time) = manager.free();
+            device.restore().expect("restore");
+            manager = VolumeManager::new_with_limits(device, time, 0xAA);
+        }
+    }
+    assert!(twins_seen > 0, "no cut left the file under two names");
+}
+
 /// The single move's refusals, made before anything is written, plus the
 /// batch's own: too many names, or one name twice.
 #[test]
@@ -1528,7 +1662,7 @@ impl<D: BlockDevice> BlockDevice for Counting<D> {
 
 /// The point of the batch: 64 files cost a fixed number of walks per batch
 /// rather than six per name, and two writes per destination block and one
-/// per source block, against two per name.
+/// per source block, against three per name.
 #[test]
 fn a_batched_move_costs_walks_per_batch_not_per_name() {
     let count = |batched: bool| {

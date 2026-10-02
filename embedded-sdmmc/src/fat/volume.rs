@@ -1009,7 +1009,10 @@ impl FatVolume {
     /// an 8.3 name and wants no long-name entries beside it.
     ///
     /// The same half of a move, with the same contract about the window
-    /// between the two writes.
+    /// between the link and the unlink. The entry takes two writes, as in
+    /// [`Self::write_linked_directory_entries`]: whole under a free mark,
+    /// then the mark lifted, so a torn sector shows a free slot or the whole
+    /// entry.
     pub(crate) fn write_linked_directory_entry<D>(
         &mut self,
         block_cache: &mut BlockCache<D>,
@@ -1033,6 +1036,9 @@ impl FatVolume {
         entry.mtime = source.mtime;
         entry.size = source.size;
         let raw = entry.serialize(self.get_fat_type());
+        let mut marked = raw;
+        marked[0] = 0xE5;
+        write_directory_slot(block_cache, slot, &marked)?;
         write_directory_slot(block_cache, slot, &raw)?;
         Ok(entry)
     }
