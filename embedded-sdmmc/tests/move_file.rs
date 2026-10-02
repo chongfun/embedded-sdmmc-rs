@@ -7,7 +7,10 @@
 
 use core::ops::ControlFlow;
 
-use embedded_sdmmc::{ClusterId, Mode, ShortFileName, VolumeIdx, VolumeManager};
+use embedded_sdmmc::{
+    Block, BlockDevice, BlockIdx, ClusterId, Mode, MoveFate, ShortFileName, VolumeIdx,
+    VolumeManager,
+};
 
 mod utils;
 
@@ -998,4 +1001,402 @@ fn a_move_that_cannot_tell_whether_its_unlink_landed_keeps_the_new_name() {
             "short={short}"
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// The batched move: the short move's contract for a set of names, in a fixed
+// number of walks
+// ---------------------------------------------------------------------------
+
+/// Create `count` files named `S000.BIN` onward, each holding its own name.
+fn make_section_files<D: embedded_sdmmc::BlockDevice>(
+    directory: &embedded_sdmmc::Directory<'_, D, utils::TestTimeSource, 4, 4, 1>,
+    count: usize,
+) -> Vec<String> {
+    (0..count)
+        .map(|i| {
+            let name = format!("S{i:03}.BIN");
+            let file = directory
+                .open_file_in_dir(name.as_str(), Mode::ReadWriteCreate)
+                .expect("create");
+            file.write(name.as_bytes()).expect("write");
+            file.close().expect("close");
+            name
+        })
+        .collect()
+}
+
+/// Every name lands under exactly that name with its body and leaves the
+/// source, as a run of single short moves would.
+#[test]
+fn a_batched_move_lands_every_name_under_exactly_that_name() {
+    let manager = manager();
+    let volume = manager.open_volume(VolumeIdx(1)).expect("volume");
+    let root = volume.open_root_dir().expect("root");
+    root.make_dir_in_dir("FROM").expect("make FROM");
+    root.make_dir_in_dir("TO").expect("make TO");
+    let from = root.open_dir("FROM").expect("FROM");
+    let to = root.open_dir("TO").expect("TO");
+    let names = make_section_files(&from, 20);
+    let refs: Vec<&str> = names.iter().map(String::as_str).collect();
+
+    let fates = from
+        .move_files_in_dir(&to, &refs[..16])
+        .expect("first batch");
+    assert_eq!(fates.len(), 16);
+    assert!(fates.iter().all(|f| *f == MoveFate::Moved));
+    let fates = from
+        .move_files_in_dir(&to, &refs[16..])
+        .expect("second batch");
+    assert_eq!(fates.len(), 4);
+    assert!(fates.iter().all(|f| *f == MoveFate::Moved));
+
+    for name in &names {
+        assert_eq!(read_all(&to, name), name.as_bytes(), "{name} kept its body");
+        assert!(
+            matches!(
+                from.find_directory_entry(name.as_str()),
+                Err(embedded_sdmmc::Error::NotFound)
+            ),
+            "{name} left the source"
+        );
+    }
+    let mut storage = [0u8; 64];
+    let mut lfn_buffer = embedded_sdmmc::LfnBuffer::new(&mut storage);
+    let mut long_names = 0;
+    to.iterate_dir_lfn(&mut lfn_buffer, |_, long| {
+        long_names += usize::from(long.is_some());
+        ControlFlow::Continue(())
+    })
+    .expect("iterate");
+    assert_eq!(long_names, 0, "a batched move writes no long-name entries");
+}
+
+/// Each moved entry describes the source's chain, size and times, as a
+/// single short link does.
+#[test]
+fn a_batched_move_carries_each_sources_chain_and_size() {
+    let manager = manager();
+    let volume = manager.open_volume(VolumeIdx(0)).expect("volume");
+    let root = volume.open_root_dir().expect("root");
+    let source = root.open_dir("TEST").expect("TEST");
+    let names = make_section_files(&source, 3);
+    let big = source
+        .open_file_in_dir("BIG.BIN", Mode::ReadWriteCreate)
+        .expect("create");
+    big.write(&[7u8; 3000]).expect("write");
+    big.close().expect("close");
+    let moving = ["S000.BIN", "BIG.BIN", "S002.BIN"];
+
+    let before: Vec<_> = moving
+        .iter()
+        .map(|n| source.find_directory_entry(*n).expect("look up"))
+        .collect();
+    source.move_files_in_dir(&root, &moving).expect("move");
+    for (old, name) in before.iter().zip(moving) {
+        let new = root.find_directory_entry(name).expect("look up");
+        assert_eq!(new.cluster, old.cluster, "{name}: same first cluster");
+        assert_eq!(new.size, old.size, "{name}: same size");
+        assert_eq!(new.ctime, old.ctime, "{name}: same creation time");
+        assert_eq!(new.mtime, old.mtime, "{name}: same modification time");
+        assert_eq!(new.attributes, old.attributes, "{name}: same attributes");
+        assert_eq!(new.name, ShortFileName::create_from_str(name).unwrap());
+    }
+    assert_eq!(read_all(&root, "BIG.BIN"), vec![7u8; 3000]);
+    assert_eq!(read_all(&source, names[1].as_str()), names[1].as_bytes());
+}
+
+/// A name the destination answers to, by a short name or by a long name in
+/// any case, is reported and its source left alone. A name the source lacks
+/// is reported missing. The rest still move.
+#[test]
+fn a_batched_move_reports_taken_and_missing_names_and_moves_the_rest() {
+    let manager = manager();
+    let volume = manager.open_volume(VolumeIdx(0)).expect("volume");
+    let root = volume.open_root_dir().expect("root");
+    let source = root.open_dir("TEST").expect("TEST");
+    make_section_files(&source, 4);
+    let occupant = root
+        .open_file_in_dir("S001.BIN", Mode::ReadWriteCreate)
+        .expect("create occupant");
+    occupant.write(b"do not clobber me").expect("write");
+    occupant.close().expect("close");
+    let long_occupant = root
+        .create_file_in_dir_lfn("s002.bin")
+        .expect("create long occupant");
+    long_occupant.write(b"long").expect("write");
+    long_occupant.close().expect("close");
+
+    let fates = source
+        .move_files_in_dir(
+            &root,
+            &["S000.BIN", "S001.BIN", "S002.BIN", "GONE.BIN", "S003.BIN"],
+        )
+        .expect("move");
+    assert_eq!(
+        &fates[..],
+        &[
+            MoveFate::Moved,
+            MoveFate::AlreadyExists,
+            MoveFate::AlreadyExists,
+            MoveFate::NotFound,
+            MoveFate::Moved,
+        ]
+    );
+    assert_eq!(read_all(&root, "S001.BIN"), b"do not clobber me");
+    assert_eq!(read_all(&source, "S001.BIN"), b"S001.BIN");
+    assert_eq!(read_all(&source, "S002.BIN"), b"S002.BIN");
+    assert_eq!(read_all(&root, "S000.BIN"), b"S000.BIN");
+    assert_eq!(read_all(&root, "S003.BIN"), b"S003.BIN");
+    assert!(matches!(
+        root.find_directory_entry("GONE.BIN"),
+        Err(embedded_sdmmc::Error::NotFound)
+    ));
+}
+
+/// A source with a long name loses its long-name entries with it, including
+/// one in the block before its short entry.
+#[test]
+fn a_batched_move_unlinks_a_long_name_across_a_block_boundary() {
+    let manager = manager();
+    let volume = manager.open_volume(VolumeIdx(1)).expect("volume");
+    let root = volume.open_root_dir().expect("root");
+    root.make_dir_in_dir("FROM").expect("make FROM");
+    let from = root.open_dir("FROM").expect("FROM");
+    // `.` and `..` take slots 0 and 1 and these take 2 to 14, so a two-entry
+    // long name starts in the last slot of the first block.
+    make_section_files(&from, 13);
+    let long = from
+        .create_file_in_dir_lfn("A long name of twenty.txt")
+        .expect("create long");
+    long.write(b"long body").expect("write");
+    long.close().expect("close");
+    let alias = from.find_directory_entry("ALONGN~1.TXT").expect("alias");
+    assert_eq!(
+        alias.entry_offset, 32,
+        "the short entry is its block's second slot"
+    );
+    let raw = |block: u32| {
+        manager.device(|d| {
+            let mut blocks = [Block::new()];
+            d.read(&mut blocks, BlockIdx(block)).expect("read");
+            blocks[0].clone()
+        })
+    };
+    let before = raw(alias.entry_block.0 - 1);
+    assert_eq!(
+        before[480 + 11],
+        0x0F,
+        "the first long-name slot is in the block before"
+    );
+
+    from.move_files_in_dir(&root, &["ALONGN~1.TXT"])
+        .expect("move");
+
+    assert_eq!(read_all(&root, "ALONGN~1.TXT"), b"long body");
+    assert_eq!(
+        raw(alias.entry_block.0 - 1)[480],
+        0xE5,
+        "earlier long-name slot"
+    );
+    let block = raw(alias.entry_block.0);
+    assert_eq!(block[0], 0xE5, "later long-name slot");
+    assert_eq!(block[32], 0xE5, "short entry");
+}
+
+/// Cut the batch at each of its writes, as power loss. Every file keeps at
+/// least one name on its chain, a file under two names has one chain, and
+/// unlinking the source name of each twin and retrying finishes the move.
+#[test]
+fn a_batched_move_cut_at_any_write_leaves_every_file_a_name() {
+    let mut twins_seen = 0;
+    for cut in 1.. {
+        let device =
+            utils::FailRegion::new(utils::make_block_device(utils::DISK_SOURCE).expect("disk"));
+        let manager: FaultyManager =
+            VolumeManager::new_with_limits(device, utils::make_time_source(), 0xAA);
+        let volume = manager.open_volume(VolumeIdx(1)).expect("volume");
+        let root = volume.open_root_dir().expect("root");
+        root.make_dir_in_dir("FROM").expect("make FROM");
+        root.make_dir_in_dir("TO").expect("make TO");
+        let from = root.open_dir("FROM").expect("FROM");
+        let to = root.open_dir("TO").expect("TO");
+        // Enough to span blocks on both sides.
+        let names = make_section_files(&from, 16);
+        let refs: Vec<&str> = names.iter().map(String::as_str).collect();
+        let before: Vec<_> = refs
+            .iter()
+            .map(|n| from.find_directory_entry(*n).expect("entry").cluster)
+            .collect();
+
+        manager.device(|d| {
+            d.write_region.set(Some((0, u32::MAX)));
+            d.writes_seen.set(0);
+            d.fail_writes_from.set(Some(cut));
+        });
+        let attempt = from.move_files_in_dir(&to, &refs);
+        let failed = manager.device(|d| d.injected.get()) > 0;
+        manager.device(|d| {
+            d.fail_writes_from.set(None);
+            d.write_region.set(None);
+        });
+        if !failed {
+            assert!(
+                attempt.is_ok(),
+                "cut {cut}: no write failed, so the batch finished"
+            );
+            assert!(twins_seen > 0, "no cut left a file under two names");
+            break;
+        }
+        assert!(attempt.is_err(), "cut {cut}: a failed write is reported");
+
+        for (name, cluster) in refs.iter().zip(&before) {
+            let old = from.find_directory_entry(*name).ok();
+            let new = to.find_directory_entry(*name).ok();
+            match (old, new) {
+                (None, None) => panic!("cut {cut}: {name} lost every name"),
+                (Some(old), Some(new)) => {
+                    assert_eq!(old.cluster, new.cluster, "cut {cut}: {name} has one chain");
+                    twins_seen += 1;
+                    from.delete_entry_in_dir(*name).expect("recover");
+                }
+                (Some(old), None) => assert_eq!(old.cluster, *cluster),
+                (None, Some(new)) => assert_eq!(new.cluster, *cluster),
+            }
+        }
+        let fates = from.move_files_in_dir(&to, &refs).expect("retry");
+        for (name, fate) in refs.iter().zip(&fates) {
+            assert_ne!(*fate, MoveFate::AlreadyExists, "cut {cut}: {name}");
+            assert_eq!(read_all(&to, name), name.as_bytes(), "cut {cut}: {name}");
+        }
+        assert!(cut < 64, "the batch made more writes than expected");
+    }
+}
+
+/// The single move's refusals, made before anything is written, plus the
+/// batch's own: too many names, or one name twice.
+#[test]
+fn a_batched_move_refuses_before_writing() {
+    use embedded_sdmmc::Error;
+    let manager = manager();
+    let volume = manager.open_volume(VolumeIdx(1)).expect("volume");
+    let root = volume.open_root_dir().expect("root");
+    root.make_dir_in_dir("FROM").expect("make FROM");
+    let from = root.open_dir("FROM").expect("FROM");
+    let names = make_section_files(&from, 17);
+    let refs: Vec<&str> = names.iter().map(String::as_str).collect();
+    from.make_dir_in_dir("SUBDIR").expect("make SUBDIR");
+
+    assert!(matches!(
+        from.move_files_in_dir(&root, &refs),
+        Err(Error::Unsupported)
+    ));
+    assert!(matches!(
+        from.move_files_in_dir(&root, &["S000.BIN", "S000.BIN"]),
+        Err(Error::Unsupported)
+    ));
+    assert!(matches!(
+        from.move_files_in_dir(&root, &["S000.BIN", "SUBDIR"]),
+        Err(Error::OpenedDirAsFile)
+    ));
+    let open = from
+        .open_file_in_dir("S001.BIN", Mode::ReadWriteAppend)
+        .expect("open");
+    assert!(matches!(
+        from.move_files_in_dir(&root, &["S000.BIN", "S001.BIN"]),
+        Err(Error::FileAlreadyOpen)
+    ));
+    open.close().expect("close");
+
+    let other = self::manager();
+    let other_volume = other.open_volume(VolumeIdx(1)).expect("volume");
+    let other_root = other_volume.open_root_dir().expect("root");
+    assert!(matches!(
+        from.move_files_in_dir(&other_root, &["S000.BIN"]),
+        Err(Error::BadHandle)
+    ));
+
+    for name in ["S000.BIN", "S001.BIN"] {
+        assert_eq!(read_all(&from, name), name.as_bytes(), "{name} stayed");
+        assert!(matches!(
+            root.find_directory_entry(name),
+            Err(Error::NotFound)
+        ));
+    }
+}
+
+/// Counts the blocks a manager reads and writes.
+struct Counting<D> {
+    inner: D,
+    reads: std::cell::Cell<u32>,
+    writes: std::cell::Cell<u32>,
+}
+
+impl<D: BlockDevice> BlockDevice for Counting<D> {
+    type Error = D::Error;
+
+    fn read(&self, blocks: &mut [Block], start: BlockIdx) -> Result<(), D::Error> {
+        self.reads.set(self.reads.get() + blocks.len() as u32);
+        self.inner.read(blocks, start)
+    }
+
+    fn write(&self, blocks: &[Block], start: BlockIdx) -> Result<(), D::Error> {
+        self.writes.set(self.writes.get() + blocks.len() as u32);
+        self.inner.write(blocks, start)
+    }
+
+    fn num_blocks(&self) -> Result<embedded_sdmmc::BlockCount, D::Error> {
+        self.inner.num_blocks()
+    }
+}
+
+/// The point of the batch: 64 files cost a fixed number of walks per batch
+/// rather than six per name, and one write per block touched.
+#[test]
+fn a_batched_move_costs_walks_per_batch_not_per_name() {
+    let count = |batched: bool| {
+        let device = Counting {
+            inner: utils::make_block_device(utils::DISK_SOURCE).expect("disk image"),
+            reads: Default::default(),
+            writes: Default::default(),
+        };
+        let manager: VolumeManager<_, _, 4, 4, 1> =
+            VolumeManager::new_with_limits(device, utils::make_time_source(), 0xAA);
+        let volume = manager.open_volume(VolumeIdx(1)).expect("volume");
+        let root = volume.open_root_dir().expect("root");
+        root.make_dir_in_dir("FROM").expect("make FROM");
+        root.make_dir_in_dir("TO").expect("make TO");
+        let from = root.open_dir("FROM").expect("FROM");
+        let to = root.open_dir("TO").expect("TO");
+        let names = make_section_files(&from, 64);
+        let refs: Vec<&str> = names.iter().map(String::as_str).collect();
+        let (reads, writes) = manager.device(|d| (d.reads.get(), d.writes.get()));
+        if batched {
+            for chunk in refs.chunks(embedded_sdmmc::MAX_MOVE_BATCH) {
+                from.move_files_in_dir(&to, chunk).expect("batch");
+            }
+        } else {
+            for name in &refs {
+                from.move_file_in_dir(*name, &to, *name).expect("move");
+            }
+        }
+        let cost = manager.device(|d| (d.reads.get() - reads, d.writes.get() - writes));
+        for name in &refs {
+            assert_eq!(read_all(&to, name), name.as_bytes());
+        }
+        cost
+    };
+    let (single_reads, single_writes) = count(false);
+    let (batch_reads, batch_writes) = count(true);
+    println!(
+        "64 files: single {single_reads}r/{single_writes}w, batched {batch_reads}r/{batch_writes}w"
+    );
+    assert!(
+        batch_reads * 4 < single_reads,
+        "batched {batch_reads} reads against {single_reads}"
+    );
+    assert!(
+        batch_writes * 6 < single_writes,
+        "batched {batch_writes} writes against {single_writes}"
+    );
 }

@@ -21,6 +21,22 @@ use crate::{
     trace,
 };
 
+/// The most names one [`VolumeManager::move_files_in_dir`] call takes. Each
+/// costs a copy of its directory entry on the stack while the batch runs.
+pub const MAX_MOVE_BATCH: usize = 16;
+
+/// What [`VolumeManager::move_files_in_dir`] did with one name.
+#[cfg_attr(feature = "defmt-log", derive(defmt::Format))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MoveFate {
+    /// Linked in the destination and unlinked from the source.
+    Moved,
+    /// Not in the source directory. Nothing was written for it.
+    NotFound,
+    /// The destination already answers to the name. The source is untouched.
+    AlreadyExists,
+}
+
 /// Wraps a block device and gives access to the FAT-formatted volumes within
 /// it.
 ///
@@ -1383,6 +1399,150 @@ where
             }
         }
         Ok(())
+    }
+
+    /// Move a set of files to another directory on the same volume, each
+    /// keeping its 8.3 name: [`Self::move_file_in_dir`] for up to
+    /// [`MAX_MOVE_BATCH`] names, in a fixed number of directory walks rather
+    /// than six per name.
+    ///
+    /// One walk of the source finds every name, one of the destination checks
+    /// its whole namespace for all of them, one more of the destination
+    /// writes the new entries into free slots, and a last walk of the source
+    /// unlinks the old ones. Writes go one per block touched, so a batch
+    /// whose entries share a block costs one write on each side.
+    ///
+    /// Every new entry is written before any source is unlinked, so a crash
+    /// or an error leaves each name under its old name, its new name, or both
+    /// on its one chain, and none under neither. That is the state a cut
+    /// [`Self::move_file_in_dir`] leaves, recovered the same way: unlink the
+    /// name you do not want with [`Self::delete_entry_in_dir`]. Unlike the
+    /// single move, a failed batch does not undo its links, because a caller
+    /// recovering from crashes recovers from this too.
+    ///
+    /// Returns what became of each name, in order: [`MoveFate::NotFound`]
+    /// when the source does not hold it, [`MoveFate::AlreadyExists`] when the
+    /// destination already answers to it by any long or short name (the
+    /// source is left alone), and [`MoveFate::Moved`] otherwise. These are
+    /// the outcomes the single move reports as errors, in the same order of
+    /// precedence.
+    ///
+    /// Fails, before writing anything, with:
+    ///
+    /// - [`Error::Unsupported`] if `names` holds more than [`MAX_MOVE_BATCH`]
+    ///   names or one name twice, or the directories are on different
+    ///   volumes.
+    /// - [`Error::OpenedDirAsFile`] or [`Error::FileAlreadyOpen`] if any name
+    ///   found is a directory or an open file, as for the single move.
+    ///
+    /// Fails part way, under the recovery above, with [`Error::NotEnoughSpace`]
+    /// if the destination fills and cannot grow, or with a device error.
+    pub fn move_files_in_dir<N>(
+        &self,
+        source_directory: RawDirectory,
+        dest_directory: RawDirectory,
+        names: &[N],
+    ) -> Result<Vec<MoveFate, MAX_MOVE_BATCH>, Error<D::Error>>
+    where
+        N: ToShortFileName + Clone,
+    {
+        if names.len() > MAX_MOVE_BATCH {
+            return Err(Error::Unsupported);
+        }
+        let mut sfns = Vec::<ShortFileName, MAX_MOVE_BATCH>::new();
+        for name in names {
+            let sfn = name
+                .clone()
+                .to_short_filename()
+                .map_err(Error::FilenameError)?;
+            if sfns.contains(&sfn) {
+                return Err(Error::Unsupported);
+            }
+            // Fits: the length was checked above.
+            let _ = sfns.push(sfn);
+        }
+
+        let mut data = self.data.try_borrow_mut().map_err(|_| Error::LockError)?;
+        let data = data.deref_mut();
+
+        let source_dir_idx = data.get_dir_by_id(source_directory)?;
+        let source_volume_id = data.open_dirs[source_dir_idx].raw_volume;
+        let dest_dir_idx = data.get_dir_by_id(dest_directory)?;
+        let dest_volume_id = data.open_dirs[dest_dir_idx].raw_volume;
+        // See `link_file_in_dir_lfn`.
+        if source_volume_id != dest_volume_id {
+            return Err(Error::Unsupported);
+        }
+        let volume_idx = data.get_volume_by_id(dest_volume_id)?;
+
+        // Each source as it is now, first match by name, as
+        // `find_directory_entry` resolves it.
+        let mut found: [Option<DirEntry>; MAX_MOVE_BATCH] = [const { None }; MAX_MOVE_BATCH];
+        let mut missing = sfns.len();
+        match &data.open_volumes[volume_idx].volume_type {
+            VolumeType::Fat(fat) => fat.iterate_dir(
+                &mut data.block_cache,
+                &data.open_dirs[source_dir_idx],
+                |de| {
+                    for (name, slot) in sfns.iter().zip(found.iter_mut()) {
+                        if slot.is_none() && de.name == *name {
+                            *slot = Some(de.clone());
+                            missing -= 1;
+                        }
+                    }
+                    if missing == 0 {
+                        ControlFlow::Break(())
+                    } else {
+                        ControlFlow::Continue(())
+                    }
+                },
+            )?,
+        }
+        for source in found.iter().flatten() {
+            if source.attributes.is_directory() {
+                return Err(Error::OpenedDirAsFile);
+            }
+            if data.file_is_open(source_volume_id, source) {
+                return Err(Error::FileAlreadyOpen);
+            }
+        }
+
+        let mut taken = [false; MAX_MOVE_BATCH];
+        match &data.open_volumes[volume_idx].volume_type {
+            VolumeType::Fat(fat) => fat.names_taken(
+                &mut data.block_cache,
+                &data.open_dirs[dest_dir_idx],
+                &sfns,
+                &mut taken,
+            )?,
+        }
+
+        let mut fates = Vec::<MoveFate, MAX_MOVE_BATCH>::new();
+        for (source, taken) in found.iter_mut().zip(taken).take(sfns.len()) {
+            let fate = match (source.is_some(), taken) {
+                (false, _) => MoveFate::NotFound,
+                (true, true) => MoveFate::AlreadyExists,
+                (true, false) => MoveFate::Moved,
+            };
+            if fate != MoveFate::Moved {
+                // Left out of both writing walks.
+                *source = None;
+            }
+            let _ = fates.push(fate);
+        }
+
+        let cluster = data.open_dirs[dest_dir_idx].cluster;
+        match &mut data.open_volumes[volume_idx].volume_type {
+            VolumeType::Fat(fat) => {
+                fat.write_linked_directory_entries(&mut data.block_cache, cluster, &sfns, &found)?;
+                fat.unlink_directory_entries(
+                    &mut data.block_cache,
+                    &data.open_dirs[source_dir_idx],
+                    &found,
+                )?;
+            }
+        }
+        Ok(fates)
     }
 
     /// The volume an open directory belongs to.

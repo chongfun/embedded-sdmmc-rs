@@ -115,7 +115,7 @@ pub use crate::sdcard::spi::SdCard;
 
 mod volume_mgr;
 #[doc(inline)]
-pub use volume_mgr::VolumeManager;
+pub use volume_mgr::{MAX_MOVE_BATCH, MoveFate, VolumeManager};
 
 #[cfg(all(feature = "defmt-log", feature = "log"))]
 compile_error!("Cannot enable both log and defmt-log");

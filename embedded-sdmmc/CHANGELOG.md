@@ -14,6 +14,13 @@ The format is based on [Keep a Changelog] and this project adheres to [Semantic 
   derive a `NAME~1.EXT` alias for whatever they are given, so a caller that
   finds its files by short name keeps finding them after a move. Same two
   writes, same window between them, same recovery by unlinking.
+- `move_files_in_dir` on `VolumeManager` and `Directory`: the short-name move
+  for up to `MAX_MOVE_BATCH` (16) names, each keeping its name, in four
+  directory walks and one write per block touched, where a run of single
+  moves walks six times per name. Every link lands before any unlink, so a
+  cut batch leaves each file under its old name, its new one, or both, and
+  is recovered as a cut single move is. Each name's `MoveFate` reports a
+  missing source or a taken destination name instead of an error.
 - `read_blocks` on `VolumeManager` and `File`: reads whole blocks of a file
   straight into the caller's buffer, asking the device for each run that
   lies together on the disk (the rest of a cluster, at most) in one call.

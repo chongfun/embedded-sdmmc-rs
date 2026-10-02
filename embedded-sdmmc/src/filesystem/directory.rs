@@ -355,6 +355,26 @@ where
         )
     }
 
+    /// Move each of `names` out of this directory into `dest_directory` on
+    /// the same volume, keeping its 8.3 name, in a fixed number of walks.
+    ///
+    /// See [`VolumeManager::move_files_in_dir`] for what each name's
+    /// [`crate::MoveFate`] means and what a failure part way leaves.
+    pub fn move_files_in_dir<N>(
+        &self,
+        dest_directory: &Self,
+        names: &[N],
+    ) -> Result<heapless::Vec<crate::MoveFate, { crate::MAX_MOVE_BATCH }>, Error<D::Error>>
+    where
+        N: ToShortFileName + Clone,
+    {
+        if !core::ptr::eq(self.volume_mgr, dest_directory.volume_mgr) {
+            return Err(Error::BadHandle);
+        }
+        self.volume_mgr
+            .move_files_in_dir(self.raw_directory, dest_directory.raw_directory, names)
+    }
+
     /// Give `source_name` in this directory a second 8.3 name, in this
     /// directory or another one on the same volume, as a plain short entry.
     ///

@@ -224,6 +224,30 @@ fn strip_lfn_words(
     true
 }
 
+/// Whether one long-name entry's words spell `name`, ignoring case, the way
+/// [`FatVolume::name_is_taken`] compares a long name with a created one.
+fn long_name_spells(words: &[u16; LFN_CHARS_PER_ENTRY], name: &ShortFileName) -> bool {
+    use core::fmt::Write as _;
+    // Eleven Latin-1 characters and a dot fit in 23 bytes of UTF-8.
+    let mut spelled = heapless::String::<24>::new();
+    if write!(spelled, "{}", name).is_err() {
+        return false;
+    }
+    let mut remaining = spelled.as_str();
+    let mut pending_low = None;
+    strip_lfn_words(
+        words
+            .iter()
+            .rev()
+            .skip_while(|w| **w == 0xFFFF)
+            .skip_while(|w| **w == 0x0000)
+            .copied(),
+        &mut remaining,
+        &mut pending_low,
+        true,
+    ) && remaining.is_empty()
+}
+
 impl PendingLfnSlots {
     fn new() -> Self {
         Self {
@@ -1013,6 +1037,116 @@ impl FatVolume {
         Ok(entry)
     }
 
+    /// [`Self::write_linked_directory_entry`] for a set of names in one walk:
+    /// each `Some` source in `sources` is linked under the name beside it in
+    /// `names`, into the first free slots, with one write per block filled.
+    ///
+    /// A failure part way leaves the entries written so far in place. Each
+    /// is half of a move, recovered as any cut move is.
+    pub(crate) fn write_linked_directory_entries<D>(
+        &mut self,
+        block_cache: &mut BlockCache<D>,
+        dir_cluster: ClusterId,
+        names: &[ShortFileName],
+        sources: &[Option<DirEntry>],
+    ) -> Result<(), Error<D::Error>>
+    where
+        D: BlockDevice,
+    {
+        let fat_type = self.get_fat_type();
+        let mut pending = names
+            .iter()
+            .zip(sources)
+            .filter_map(|(name, source)| source.as_ref().map(|source| (*name, source)))
+            .peekable();
+        if pending.peek().is_none() {
+            return Ok(());
+        }
+        let (mut current_cluster, root_block, blocks_per_step, fixed_root) =
+            self.directory_walk_start(dir_cluster);
+        loop {
+            let first_block = root_block.unwrap_or_else(|| self.cluster_to_block(current_cluster));
+            for block_idx in first_block.range(blocks_per_step) {
+                let mut dirty = false;
+                let block = block_cache
+                    .read_mut(block_idx)
+                    .map_err(Error::DeviceError)?;
+                for (index, bytes) in block.chunks_exact_mut(OnDiskDirEntry::LEN).enumerate() {
+                    if OnDiskDirEntry::new(bytes).is_valid() {
+                        continue;
+                    }
+                    let Some((name, source)) = pending.next() else {
+                        break;
+                    };
+                    let mut entry = DirEntry::new(
+                        name,
+                        source.attributes,
+                        source.cluster,
+                        source.ctime,
+                        block_idx,
+                        (index * OnDiskDirEntry::LEN) as u32,
+                    );
+                    entry.mtime = source.mtime;
+                    entry.size = source.size;
+                    bytes.copy_from_slice(&entry.serialize(fat_type)[..]);
+                    dirty = true;
+                }
+                if dirty {
+                    block_cache.write_back().map_err(Error::DeviceError)?;
+                }
+                if pending.peek().is_none() {
+                    return Ok(());
+                }
+            }
+            if fixed_root {
+                return Err(Error::NotEnoughSpace);
+            }
+            current_cluster = match self.next_cluster(block_cache, current_cluster) {
+                Ok(next) => next,
+                Err(Error::EndOfFile) => {
+                    self.alloc_cluster(block_cache, Some(current_cluster), true)?
+                }
+                Err(error) => return Err(error),
+            };
+        }
+    }
+
+    /// Where a walk over a directory's slots starts: its first cluster, the
+    /// fixed FAT16 root's first block if it is that root, how many blocks to
+    /// read before following the chain, and whether there is no chain.
+    fn directory_walk_start(
+        &self,
+        dir_cluster: ClusterId,
+    ) -> (ClusterId, Option<BlockIdx>, BlockCount, bool) {
+        match &self.fat_specific_info {
+            FatSpecificInfo::Fat16(info) if dir_cluster == ClusterId::ROOT_DIR => {
+                let bytes = u32::from(info.root_entries_count) * OnDiskDirEntry::LEN_U32;
+                (
+                    ClusterId::ROOT_DIR,
+                    Some(self.lba_start + info.first_root_dir_block),
+                    BlockCount::from_bytes(bytes),
+                    true,
+                )
+            }
+            FatSpecificInfo::Fat16(_) => (
+                dir_cluster,
+                None,
+                BlockCount(u32::from(self.blocks_per_cluster)),
+                false,
+            ),
+            FatSpecificInfo::Fat32(info) => (
+                if dir_cluster == ClusterId::ROOT_DIR {
+                    info.first_root_dir_cluster
+                } else {
+                    dir_cluster
+                },
+                None,
+                BlockCount(u32::from(self.blocks_per_cluster)),
+                false,
+            ),
+        }
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn write_directory_entry_lfn<D>(
         &mut self,
@@ -1581,6 +1715,51 @@ impl FatVolume {
         Ok(false)
     }
 
+    /// [`Self::name_is_taken`] for a set of 8.3 names in one walk. Sets
+    /// `taken[i]` when the directory answers to `names[i]` by a short name
+    /// or, ignoring case, by a long name. Leaves the other flags alone.
+    ///
+    /// A long name that spells an 8.3 name has at most twelve characters,
+    /// all in the Basic Multilingual Plane, so it is a single long-name
+    /// entry. Longer chains are skipped without being read.
+    pub(crate) fn names_taken<D>(
+        &self,
+        block_cache: &mut BlockCache<D>,
+        dir_info: &DirectoryInfo,
+        names: &[ShortFileName],
+        taken: &mut [bool],
+    ) -> Result<(), Error<D::Error>>
+    where
+        D: BlockDevice,
+    {
+        // The one-entry long name just seen, waiting for its short entry.
+        let mut long: Option<(u8, [u16; LFN_CHARS_PER_ENTRY])> = None;
+        self.iterate_dir_internal(block_cache, dir_info, |de, odde| {
+            // Every valid entry, as `find_directory_entry` compares them.
+            for (name, flag) in names.iter().zip(taken.iter_mut()) {
+                if de.name == *name {
+                    *flag = true;
+                }
+            }
+            match odde.lfn_contents() {
+                Some((true, 1, csum, words)) => long = Some((csum, words)),
+                Some(_) => long = None,
+                None => {
+                    if let Some((csum, words)) = long.take() {
+                        if de.name.csum() == csum {
+                            for (name, flag) in names.iter().zip(taken.iter_mut()) {
+                                if !*flag && long_name_spells(&words, name) {
+                                    *flag = true;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            ControlFlow::Continue(())
+        })
+    }
+
     fn find_directory_entry_by_lfn_inner<D>(
         &self,
         block_cache: &mut BlockCache<D>,
@@ -1733,6 +1912,115 @@ impl FatVolume {
     {
         let slots = self.find_directory_entry_slots(block_cache, dir_info, match_name)?;
         mark_directory_slots_deleted(block_cache, &slots)
+    }
+
+    /// Unlink each `Some` entry in `entries`, found by the block and offset
+    /// it records, with its long-name slots, in one walk and one write per
+    /// block touched.
+    ///
+    /// As in [`mark_directory_slots_deleted`], the short entry is the commit
+    /// point: long-name slots in an earlier block are marked only after the
+    /// block holding the short entry is written. [`Error::NotFound`] if the
+    /// walk ends with an entry not reached.
+    pub(crate) fn unlink_directory_entries<D>(
+        &self,
+        block_cache: &mut BlockCache<D>,
+        dir_info: &DirectoryInfo,
+        entries: &[Option<DirEntry>],
+    ) -> Result<(), Error<D::Error>>
+    where
+        D: BlockDevice,
+    {
+        let mut left = entries.iter().flatten().count();
+        if left == 0 {
+            return Ok(());
+        }
+        let (mut current_cluster, root_block, blocks_per_step, fixed_root) =
+            self.directory_walk_start(dir_info.cluster);
+        let mut pending = PendingLfnSlots::new();
+        loop {
+            let first_block = root_block.unwrap_or_else(|| self.cluster_to_block(current_cluster));
+            for block_idx in first_block.range(blocks_per_step) {
+                let mut dirty = false;
+                for index in 0..Block::LEN / OnDiskDirEntry::LEN {
+                    let start = index * OnDiskDirEntry::LEN;
+                    let block = block_cache
+                        .read_mut(block_idx)
+                        .map_err(Error::DeviceError)?;
+                    let entry = OnDiskDirEntry::new(&block[start..start + OnDiskDirEntry::LEN]);
+                    if entry.is_end() {
+                        if dirty {
+                            block_cache.write_back().map_err(Error::DeviceError)?;
+                        }
+                        return Err(Error::NotFound);
+                    }
+                    if !entry.is_valid() {
+                        pending.clear();
+                        continue;
+                    }
+                    let slot = DirectorySlot {
+                        block: block_idx,
+                        offset: start as u32,
+                    };
+                    if entry.is_lfn() {
+                        pending.observe(&entry, slot);
+                        continue;
+                    }
+                    let hit = entries.iter().flatten().find(|e| {
+                        e.entry_block == block_idx
+                            && e.entry_offset == slot.offset
+                            && entry.matches(&e.name)
+                    });
+                    let Some(hit) = hit else {
+                        pending.clear();
+                        continue;
+                    };
+                    let owns_long_name = pending.belongs_to(&hit.name);
+                    block[start] = 0xE5;
+                    dirty = true;
+                    let mut earlier = false;
+                    if owns_long_name {
+                        for lfn in pending.slots.iter() {
+                            if lfn.block == block_idx {
+                                block[lfn.offset as usize] = 0xE5;
+                            } else {
+                                earlier = true;
+                            }
+                        }
+                    }
+                    if earlier {
+                        // Commit the short entry before tidying the block
+                        // before it, as a single unlink does.
+                        block_cache.write_back().map_err(Error::DeviceError)?;
+                        dirty = false;
+                        for lfn in pending.slots.iter().filter(|s| s.block != block_idx) {
+                            if mark_one_slot_deleted(block_cache, lfn).is_err() {
+                                break;
+                            }
+                        }
+                    }
+                    pending.clear();
+                    left -= 1;
+                    if left == 0 {
+                        if dirty {
+                            block_cache.write_back().map_err(Error::DeviceError)?;
+                        }
+                        return Ok(());
+                    }
+                }
+                if dirty {
+                    block_cache.write_back().map_err(Error::DeviceError)?;
+                }
+            }
+            if fixed_root {
+                return Err(Error::NotFound);
+            }
+            current_cluster = match self.next_cluster(block_cache, current_cluster) {
+                Ok(next) => next,
+                Err(Error::EndOfFile) => return Err(Error::NotFound),
+                Err(error) => return Err(error),
+            };
+        }
     }
 
     fn find_directory_entry_slots<D>(
