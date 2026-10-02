@@ -11,7 +11,7 @@
 //! that was actually completed.
 
 use embedded_sdmmc::{Block, BlockDevice, BlockIdx, Mode, VolumeIdx, VolumeManager};
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 
 use utils::FailRegion;
 
@@ -65,6 +65,10 @@ fn a_lookup_that_cannot_read_the_fat_is_not_a_missing_file() {
         fail_write_number: Cell::new(None),
         land_before_failing: Cell::new(false),
         blind_after_failing: Cell::new(false),
+        land_bytes_before_failing: Cell::new(None),
+        log_changes: Cell::new(false),
+        changes: RefCell::new(Vec::new()),
+        undo: RefCell::new(None),
     };
 
     let manager: VolumeManager<_, _, 4, 4, 1> =
@@ -153,6 +157,10 @@ fn a_create_that_cannot_read_the_fat_is_not_a_full_disk(
         fail_write_number: Cell::new(None),
         land_before_failing: Cell::new(false),
         blind_after_failing: Cell::new(false),
+        land_bytes_before_failing: Cell::new(None),
+        log_changes: Cell::new(false),
+        changes: RefCell::new(Vec::new()),
+        undo: RefCell::new(None),
     };
 
     let manager: VolumeManager<_, _, 4, 4, 1> =
@@ -228,6 +236,10 @@ fn a_write_that_cannot_update_the_fat_is_not_a_full_disk() {
         fail_write_number: Cell::new(None),
         land_before_failing: Cell::new(false),
         blind_after_failing: Cell::new(false),
+        land_bytes_before_failing: Cell::new(None),
+        log_changes: Cell::new(false),
+        changes: RefCell::new(Vec::new()),
+        undo: RefCell::new(None),
     };
 
     let manager: VolumeManager<_, _, 4, 4, 1> =
@@ -284,6 +296,10 @@ fn a_long_name_open_that_cannot_read_the_fat_is_not_a_missing_file() {
         fail_write_number: Cell::new(None),
         land_before_failing: Cell::new(false),
         blind_after_failing: Cell::new(false),
+        land_bytes_before_failing: Cell::new(None),
+        log_changes: Cell::new(false),
+        changes: RefCell::new(Vec::new()),
+        undo: RefCell::new(None),
     };
 
     let manager: VolumeManager<_, _, 4, 4, 1> =
@@ -433,6 +449,10 @@ fn a_failed_first_scan_is_not_a_reason_to_wrap_around() {
         fail_write_number: Cell::new(None),
         land_before_failing: Cell::new(false),
         blind_after_failing: Cell::new(false),
+        land_bytes_before_failing: Cell::new(None),
+        log_changes: Cell::new(false),
+        changes: RefCell::new(Vec::new()),
+        undo: RefCell::new(None),
     };
     let manager: VolumeManager<_, _, 4, 4, 1> =
         VolumeManager::new_with_limits(device, utils::make_time_source(), 0xAA);
@@ -499,6 +519,10 @@ fn a_failed_entry_write_is_not_committed_by_its_own_cleanup() {
             fail_write_number: Cell::new(Some(u32::MAX)),
             land_before_failing: Cell::new(false),
             blind_after_failing: Cell::new(false),
+            land_bytes_before_failing: Cell::new(None),
+            log_changes: Cell::new(false),
+            changes: RefCell::new(Vec::new()),
+            undo: RefCell::new(None),
         };
         let manager: VolumeManager<_, _, 4, 4, 1> =
             VolumeManager::new_with_limits(device, utils::make_time_source(), 0xAA);
@@ -532,6 +556,10 @@ fn a_failed_entry_write_is_not_committed_by_its_own_cleanup() {
         fail_write_number: Cell::new(Some(writes_for_a_create)),
         land_before_failing: Cell::new(false),
         blind_after_failing: Cell::new(false),
+        land_bytes_before_failing: Cell::new(None),
+        log_changes: Cell::new(false),
+        changes: RefCell::new(Vec::new()),
+        undo: RefCell::new(None),
     };
     let manager: VolumeManager<_, _, 4, 4, 1> =
         VolumeManager::new_with_limits(device, utils::make_time_source(), 0xAA);

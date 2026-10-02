@@ -1039,7 +1039,16 @@ impl FatVolume {
 
     /// [`Self::write_linked_directory_entry`] for a set of names in one walk:
     /// each `Some` source in `sources` is linked under the name beside it in
-    /// `names`, into the first free slots, with one write per block filled.
+    /// `names`, into the first free slots, with two writes per block filled.
+    ///
+    /// The first write lands every entry whole but for its first byte, left
+    /// at `0xE5`, which is a free slot to every reader. The second flips the
+    /// first bytes. A sector the card takes only the front of therefore
+    /// shows a reader a free slot or a whole entry, and not a name standing
+    /// over a cluster and size that are not the file's: the first write
+    /// changes nothing a reader sees, and the second changes one byte per
+    /// entry. One write per block would leave that window open at every
+    /// byte of every entry in it.
     ///
     /// A failure part way leaves the entries written so far in place. Each
     /// is half of a move, recovered as any cut move is.
@@ -1067,7 +1076,10 @@ impl FatVolume {
         loop {
             let first_block = root_block.unwrap_or_else(|| self.cluster_to_block(current_cluster));
             for block_idx in first_block.range(blocks_per_step) {
-                let mut dirty = false;
+                // The slots filled in this block, and the first byte each
+                // entry takes once the second write lands.
+                let mut filled = [(0usize, 0u8); Block::LEN / OnDiskDirEntry::LEN];
+                let mut count = 0;
                 let block = block_cache
                     .read_mut(block_idx)
                     .map_err(Error::DeviceError)?;
@@ -1088,10 +1100,20 @@ impl FatVolume {
                     );
                     entry.mtime = source.mtime;
                     entry.size = source.size;
-                    bytes.copy_from_slice(&entry.serialize(fat_type)[..]);
-                    dirty = true;
+                    let raw = entry.serialize(fat_type);
+                    bytes.copy_from_slice(&raw[..]);
+                    filled[count] = (index * OnDiskDirEntry::LEN, raw[0]);
+                    count += 1;
+                    bytes[0] = 0xE5;
                 }
-                if dirty {
+                if count > 0 {
+                    block_cache.write_back().map_err(Error::DeviceError)?;
+                    let block = block_cache
+                        .read_mut(block_idx)
+                        .map_err(Error::DeviceError)?;
+                    for (offset, first) in &filled[..count] {
+                        block[*offset] = *first;
+                    }
                     block_cache.write_back().map_err(Error::DeviceError)?;
                 }
                 if pending.peek().is_none() {

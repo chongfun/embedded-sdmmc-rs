@@ -62,7 +62,7 @@ pub enum Error {
 ///
 /// The slice should be a multiple of `embedded_sdmmc::Block::LEN` bytes in
 /// length. If it isn't the trailing data is discarded.
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 
 /// Wraps a device and fails reads that land in a chosen block range.
 ///
@@ -94,6 +94,17 @@ pub struct FailRegion<D> {
     /// card that took a sector and then stopped answering, so nothing can
     /// find out whether it did.
     pub blind_after_failing: Cell<bool>,
+    /// With `land_before_failing`, land only this many bytes of the failed
+    /// write's first block: the sector a card lost power part way through.
+    /// `None` lands the whole write.
+    pub land_bytes_before_failing: Cell<Option<usize>>,
+    /// Record the offsets each write to `write_region` changes, in order,
+    /// so a tear can be aimed at every byte that matters.
+    pub log_changes: Cell<bool>,
+    pub changes: RefCell<Vec<Vec<usize>>>,
+    /// While `Some`, keep the first contents of every block written, so
+    /// `restore` puts the disk back without unpacking the image again.
+    pub undo: RefCell<Option<Vec<(BlockIdx, Block)>>>,
 }
 
 #[derive(Debug)]
@@ -135,6 +146,13 @@ where
             let last = start.0 + blocks.len() as u32;
             if start.0 < to && last > from {
                 self.writes_seen.set(self.writes_seen.get() + 1);
+                if self.log_changes.get() {
+                    let old = self.block(start)?;
+                    let changed = (0..Block::LEN)
+                        .filter(|i| old[*i] != blocks[0][*i])
+                        .collect();
+                    self.changes.borrow_mut().push(changed);
+                }
                 // `fail_writes_from`, when set, is the whole rule: everything
                 // before the cut-off goes through so a multi-write operation
                 // can be stopped partway rather than at its first step.
@@ -148,7 +166,15 @@ where
                 if fail {
                     self.injected.set(self.injected.get() + 1);
                     if self.land_before_failing.get() {
-                        self.inner.write(blocks, start).map_err(FailError::Inner)?;
+                        match self.land_bytes_before_failing.get() {
+                            None => self.write_recorded(blocks, start)?,
+                            Some(bytes) => {
+                                let mut torn = self.block(start)?;
+                                let bytes = bytes.min(Block::LEN);
+                                torn[..bytes].copy_from_slice(&blocks[0][..bytes]);
+                                self.write_recorded(core::slice::from_ref(&torn), start)?;
+                            }
+                        }
                     }
                     if self.blind_after_failing.get() {
                         self.region.set(self.write_region.get());
@@ -157,7 +183,7 @@ where
                 }
             }
         }
-        self.inner.write(blocks, start).map_err(FailError::Inner)
+        self.write_recorded(blocks, start)
     }
 
     fn num_blocks(&self) -> Result<BlockCount, Self::Error> {
@@ -178,7 +204,54 @@ impl<D> FailRegion<D> {
             fail_write_number: Cell::new(None),
             land_before_failing: Cell::new(false),
             blind_after_failing: Cell::new(false),
+            land_bytes_before_failing: Cell::new(None),
+            log_changes: Cell::new(false),
+            changes: RefCell::new(Vec::new()),
+            undo: RefCell::new(None),
         }
+    }
+}
+
+impl<D> FailRegion<D>
+where
+    D: BlockDevice<Error = Error>,
+{
+    /// One block as the disk holds it now.
+    fn block(&self, idx: BlockIdx) -> Result<Block, FailError> {
+        let mut block = Block::new();
+        self.inner
+            .read(core::slice::from_mut(&mut block), idx)
+            .map_err(FailError::Inner)?;
+        Ok(block)
+    }
+
+    /// Write through, keeping each block's first contents while `undo` is on.
+    fn write_recorded(&self, blocks: &[Block], start: BlockIdx) -> Result<(), FailError> {
+        if let Some(undo) = self.undo.borrow_mut().as_mut() {
+            for i in 0..blocks.len() as u32 {
+                let idx = BlockIdx(start.0 + i);
+                if !undo.iter().any(|(kept, _)| *kept == idx) {
+                    let old = self.block(idx)?;
+                    undo.push((idx, old));
+                }
+            }
+        }
+        self.inner.write(blocks, start).map_err(FailError::Inner)
+    }
+
+    /// Put back every block written since `undo` was turned on, and turn
+    /// it off. The caller makes a new manager afterwards: the old one's
+    /// block cache may hold a sector this rewrote.
+    pub fn restore(&self) -> Result<(), FailError> {
+        let Some(undo) = self.undo.borrow_mut().take() else {
+            return Ok(());
+        };
+        for (idx, block) in undo.iter().rev() {
+            self.inner
+                .write(core::slice::from_ref(block), *idx)
+                .map_err(FailError::Inner)?;
+        }
+        Ok(())
     }
 }
 

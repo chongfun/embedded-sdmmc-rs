@@ -1273,6 +1273,182 @@ fn a_batched_move_cut_at_any_write_leaves_every_file_a_name() {
     }
 }
 
+/// Cut each write of a 16-name batch at every byte it changes, as a sector
+/// the card took only the front of before power went, then lose every later
+/// write. The torn directories show each file under its old name, its new
+/// name, or both on one chain, and nothing else: no part of a name, no name
+/// over a cluster or size that is not the file's. Unlinking the source side
+/// of each twin and retrying finishes the move. The disk is reset between
+/// cuts from the harness's undo log, so the image is unpacked once.
+#[test]
+fn a_batched_move_torn_inside_any_sector_leaves_every_file_a_name() {
+    let device =
+        utils::FailRegion::new(utils::make_block_device(utils::DISK_SOURCE).expect("disk"));
+    let mut manager: FaultyManager =
+        VolumeManager::new_with_limits(device, utils::make_time_source(), 0xAA);
+    let names: Vec<String>;
+    let before: Vec<_>;
+    {
+        let volume = manager.open_volume(VolumeIdx(1)).expect("volume");
+        let root = volume.open_root_dir().expect("root");
+        root.make_dir_in_dir("FROM").expect("make FROM");
+        root.make_dir_in_dir("TO").expect("make TO");
+        let from = root.open_dir("FROM").expect("FROM");
+        // Enough to span blocks on both sides.
+        names = make_section_files(&from, 16);
+        before = names
+            .iter()
+            .map(|n| {
+                from.find_directory_entry(n.as_str())
+                    .expect("entry")
+                    .cluster
+            })
+            .collect();
+    }
+    let refs: Vec<&str> = names.iter().map(String::as_str).collect();
+
+    // One clean batch, undone afterwards, to learn which bytes each write
+    // changes: a cut just after each is a state no other cut reaches.
+    manager.device(|d| {
+        d.write_region.set(Some((0, u32::MAX)));
+        d.writes_seen.set(0);
+        // Count and log every write, fail none.
+        d.fail_writes_from.set(Some(u32::MAX));
+        d.log_changes.set(true);
+        *d.undo.borrow_mut() = Some(Vec::new());
+    });
+    {
+        let volume = manager.open_volume(VolumeIdx(1)).expect("volume");
+        let root = volume.open_root_dir().expect("root");
+        let from = root.open_dir("FROM").expect("FROM");
+        let to = root.open_dir("TO").expect("TO");
+        from.move_files_in_dir(&to, &refs).expect("clean batch");
+        // Before the handles close: closing the volume writes too.
+        manager.device(|d| {
+            d.log_changes.set(false);
+            d.fail_writes_from.set(None);
+            d.write_region.set(None);
+        });
+    }
+    let (device, time) = manager.free();
+    device.restore().expect("restore");
+    let changes = device.changes.replace(Vec::new());
+    manager = VolumeManager::new_with_limits(device, time, 0xAA);
+    assert!(
+        changes.iter().any(|c| c.iter().any(|b| b % 32 != 0)),
+        "no write changed a byte inside an entry, so no cut lands inside one"
+    );
+
+    let mut twins_seen = 0;
+    let mut partial_blocks = 0;
+    for (write, changed) in changes.iter().enumerate() {
+        let number = write as u32 + 1;
+        let mut cuts = vec![0];
+        cuts.extend(changed.iter().map(|b| b + 1));
+        for cut in cuts {
+            manager.device(|d| {
+                d.write_region.set(Some((0, u32::MAX)));
+                d.writes_seen.set(0);
+                d.injected.set(0);
+                d.fail_writes_from.set(Some(number));
+                d.land_before_failing.set(true);
+                d.land_bytes_before_failing.set(Some(cut));
+                *d.undo.borrow_mut() = Some(Vec::new());
+            });
+            {
+                let volume = manager.open_volume(VolumeIdx(1)).expect("volume");
+                let root = volume.open_root_dir().expect("root");
+                let from = root.open_dir("FROM").expect("FROM");
+                let to = root.open_dir("TO").expect("TO");
+                let attempt = from.move_files_in_dir(&to, &refs);
+                assert!(
+                    manager.device(|d| d.injected.get()) > 0,
+                    "write {number} cut {cut}: the batch made fewer writes than the clean run"
+                );
+                assert!(
+                    attempt.is_err(),
+                    "write {number} cut {cut}: the cut is reported"
+                );
+                manager.device(|d| {
+                    d.fail_writes_from.set(None);
+                    d.land_before_failing.set(false);
+                    d.land_bytes_before_failing.set(None);
+                    d.write_region.set(None);
+                });
+
+                // What a reader of the torn destination sees.
+                let mut visible = 0;
+                to.iterate_dir(|entry| {
+                    let name = entry.name.to_string();
+                    if name == "." || name == ".." {
+                        return ControlFlow::Continue(());
+                    }
+                    let Some(i) = names.iter().position(|n| *n == name) else {
+                        panic!("write {number} cut {cut}: TO lists {name:?}, which is no name of the batch");
+                    };
+                    assert_eq!(
+                        entry.cluster, before[i],
+                        "write {number} cut {cut}: {name} in TO stands over another chain"
+                    );
+                    assert_eq!(
+                        entry.size as usize,
+                        name.len(),
+                        "write {number} cut {cut}: {name} in TO has another size"
+                    );
+                    visible += 1;
+                    ControlFlow::Continue(())
+                })
+                .expect("list TO");
+                // The cut fell inside a block's run of new entries: the state
+                // a whole-write cut cannot produce.
+                let per_block = changed.iter().filter(|b| **b % 32 == 0).count();
+                if cut > 0 && per_block > 1 && visible % per_block != 0 {
+                    partial_blocks += 1;
+                }
+
+                for (name, cluster) in refs.iter().zip(&before) {
+                    let old = from.find_directory_entry(*name).ok();
+                    let new = to.find_directory_entry(*name).ok();
+                    match (old, new) {
+                        (None, None) => panic!("write {number} cut {cut}: {name} lost every name"),
+                        (Some(old), Some(new)) => {
+                            assert_eq!(
+                                old.cluster, new.cluster,
+                                "write {number} cut {cut}: {name} has one chain"
+                            );
+                            twins_seen += 1;
+                            from.delete_entry_in_dir(*name).expect("recover");
+                        }
+                        (Some(old), None) => assert_eq!(old.cluster, *cluster),
+                        (None, Some(new)) => assert_eq!(new.cluster, *cluster),
+                    }
+                }
+                let fates = from.move_files_in_dir(&to, &refs).expect("retry");
+                for (name, fate) in refs.iter().zip(&fates) {
+                    assert_ne!(
+                        *fate,
+                        MoveFate::AlreadyExists,
+                        "write {number} cut {cut}: {name}"
+                    );
+                    assert_eq!(
+                        read_all(&to, name),
+                        name.as_bytes(),
+                        "write {number} cut {cut}: {name}"
+                    );
+                }
+            }
+            let (device, time) = manager.free();
+            device.restore().expect("restore");
+            manager = VolumeManager::new_with_limits(device, time, 0xAA);
+        }
+    }
+    assert!(twins_seen > 0, "no cut left a file under two names");
+    assert!(
+        partial_blocks > 0,
+        "no cut left part of a block's new entries visible, so none fell inside the second write"
+    );
+}
+
 /// The single move's refusals, made before anything is written, plus the
 /// batch's own: too many names, or one name twice.
 #[test]
@@ -1351,7 +1527,8 @@ impl<D: BlockDevice> BlockDevice for Counting<D> {
 }
 
 /// The point of the batch: 64 files cost a fixed number of walks per batch
-/// rather than six per name, and one write per block touched.
+/// rather than six per name, and two writes per destination block and one
+/// per source block, against two per name.
 #[test]
 fn a_batched_move_costs_walks_per_batch_not_per_name() {
     let count = |batched: bool| {
@@ -1396,7 +1573,7 @@ fn a_batched_move_costs_walks_per_batch_not_per_name() {
         "batched {batch_reads} reads against {single_reads}"
     );
     assert!(
-        batch_writes * 6 < single_writes,
+        batch_writes * 5 < single_writes,
         "batched {batch_writes} writes against {single_writes}"
     );
 }

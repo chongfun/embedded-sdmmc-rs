@@ -8,7 +8,7 @@
 //! first, record the cluster numbers somewhere durable, and then free them
 //! by name, replaying the list as often as it takes.
 
-use core::cell::Cell;
+use core::cell::{Cell, RefCell};
 
 use embedded_sdmmc::{
     Block, BlockDevice, BlockIdx, ClusterId, Error, Mode, VolumeIdx, VolumeManager,
@@ -312,6 +312,10 @@ fn a_replay_repairs_a_half_mirrored_free() {
         fail_write_number: Cell::new(None),
         land_before_failing: Cell::new(false),
         blind_after_failing: Cell::new(false),
+        land_bytes_before_failing: Cell::new(None),
+        log_changes: Cell::new(false),
+        changes: RefCell::new(Vec::new()),
+        undo: RefCell::new(None),
     };
     let manager: VolumeManager<_, _, 4, 4, 1> =
         VolumeManager::new_with_limits(device, utils::make_time_source(), 0xAA);
