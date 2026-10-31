@@ -45,8 +45,22 @@ struct PendingLfnSlots {
 fn basis_byte(c: char) -> u8 {
     match c {
         c if c.is_ascii_lowercase() => c.to_ascii_uppercase() as u8,
-        '\u{0000}'..='\u{001F}' | '"' | '*' | '+' | ',' | '/' | ':' | ';' | '<' | '=' | '>'
-        | '?' | '[' | '\\' | ']' | '|' => b'_',
+        '\u{0000}'..='\u{001F}'
+        | '"'
+        | '*'
+        | '+'
+        | ','
+        | '/'
+        | ':'
+        | ';'
+        | '<'
+        | '='
+        | '>'
+        | '?'
+        | '['
+        | '\\'
+        | ']'
+        | '|' => b'_',
         c if !c.is_ascii() => b'_',
         c => c as u8,
     }
@@ -200,8 +214,8 @@ fn strip_lfn_words(
                 // have written.
                 return false;
             };
-            let code_point = 0x1_0000u32
-                + (((u32::from(word) - 0xD800) << 10) | (u32::from(low) - 0xDC00));
+            let code_point =
+                0x1_0000u32 + (((u32::from(word) - 0xD800) << 10) | (u32::from(low) - 0xDC00));
             match char::from_u32(code_point) {
                 Some(c) => c,
                 None => return false,
@@ -1421,9 +1435,7 @@ impl FatVolume {
                     // number, so this bound is what limits how long a name can
                     // be listed -- it has to reach whatever creation is willing
                     // to write.
-                    (true, sequence, _)
-                        if (0x02..=MAX_LFN_ENTRIES as u8).contains(&sequence) =>
-                    {
+                    (true, sequence, _) if (0x02..=MAX_LFN_ENTRIES as u8).contains(&sequence) => {
                         lfn_buffer.clear();
                         lfn_buffer.push(&buffer);
                         SeqState::Remaining {

@@ -73,7 +73,9 @@ fn a_lookup_that_cannot_read_the_fat_is_not_a_missing_file() {
 
     let manager: VolumeManager<_, _, 4, 4, 1> =
         VolumeManager::new_with_limits(device, utils::make_time_source(), 0xAA);
-    let volume = manager.open_volume(VolumeIdx(1)).expect("open FAT32 volume");
+    let volume = manager
+        .open_volume(VolumeIdx(1))
+        .expect("open FAT32 volume");
     let root = volume.open_root_dir().expect("open root");
 
     // The walk only consults the FAT when it runs off the end of a cluster.
@@ -244,7 +246,9 @@ fn a_write_that_cannot_update_the_fat_is_not_a_full_disk() {
 
     let manager: VolumeManager<_, _, 4, 4, 1> =
         VolumeManager::new_with_limits(device, utils::make_time_source(), 0xAA);
-    let volume = manager.open_volume(VolumeIdx(1)).expect("open FAT32 volume");
+    let volume = manager
+        .open_volume(VolumeIdx(1))
+        .expect("open FAT32 volume");
     let root = volume.open_root_dir().expect("open root");
 
     let file = root
@@ -304,7 +308,9 @@ fn a_long_name_open_that_cannot_read_the_fat_is_not_a_missing_file() {
 
     let manager: VolumeManager<_, _, 4, 4, 1> =
         VolumeManager::new_with_limits(device, utils::make_time_source(), 0xAA);
-    let volume = manager.open_volume(VolumeIdx(1)).expect("open FAT32 volume");
+    let volume = manager
+        .open_volume(VolumeIdx(1))
+        .expect("open FAT32 volume");
     let root = volume.open_root_dir().expect("open root");
 
     // As in the short-name case, the walk only reaches the FAT once the
@@ -379,14 +385,17 @@ fn claiming_the_last_free_cluster_still_succeeds() {
 
     let manager: VolumeManager<_, _, 4, 4, 1> =
         VolumeManager::new_with_limits(inner, utils::make_time_source(), 0xAA);
-    let volume = manager.open_volume(VolumeIdx(0)).expect("open FAT16 volume");
+    let volume = manager
+        .open_volume(VolumeIdx(0))
+        .expect("open FAT16 volume");
     let root = volume.open_root_dir().expect("open root");
 
     let file = root
         .open_file_in_dir("LAST.TXT", Mode::ReadWriteCreate)
         .expect("create file");
     // The first write allocates the file's first cluster -- the only one left.
-    file.write(b"the last cluster").expect("write into the last free cluster");
+    file.write(b"the last cluster")
+        .expect("write into the last free cluster");
     file.close().expect("close");
 
     // The claim has to have been recorded, or the cluster is orphaned.
@@ -456,7 +465,9 @@ fn a_failed_first_scan_is_not_a_reason_to_wrap_around() {
     };
     let manager: VolumeManager<_, _, 4, 4, 1> =
         VolumeManager::new_with_limits(device, utils::make_time_source(), 0xAA);
-    let volume = manager.open_volume(VolumeIdx(1)).expect("open FAT32 volume");
+    let volume = manager
+        .open_volume(VolumeIdx(1))
+        .expect("open FAT32 volume");
     let root = volume.open_root_dir().expect("open root");
 
     let file = root
@@ -563,7 +574,9 @@ fn a_failed_entry_write_is_not_committed_by_its_own_cleanup() {
     };
     let manager: VolumeManager<_, _, 4, 4, 1> =
         VolumeManager::new_with_limits(device, utils::make_time_source(), 0xAA);
-    let volume = manager.open_volume(VolumeIdx(1)).expect("open FAT32 volume");
+    let volume = manager
+        .open_volume(VolumeIdx(1))
+        .expect("open FAT32 volume");
     let root = volume.open_root_dir().expect("open root");
 
     manager.device(|d| d.write_region.set(Some((dir_from, dir_to))));

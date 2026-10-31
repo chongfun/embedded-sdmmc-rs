@@ -89,9 +89,8 @@ fn a_moved_file_keeps_its_body_and_loses_its_old_name() {
 /// holding half of.
 #[test]
 fn a_move_that_cannot_retire_the_old_name_leaves_nothing_behind() {
-    let device = utils::FailRegion::new(
-        utils::make_block_device(utils::DISK_SOURCE).expect("disk image"),
-    );
+    let device =
+        utils::FailRegion::new(utils::make_block_device(utils::DISK_SOURCE).expect("disk image"));
     let manager: VolumeManager<_, _, 4, 4, 1> =
         VolumeManager::new_with_limits(device, utils::make_time_source(), 0xAA);
     let volume = manager.open_volume(VolumeIdx(0)).expect("volume");
@@ -113,15 +112,17 @@ fn a_move_that_cannot_retire_the_old_name_leaves_nothing_behind() {
         d.write_region
             .set(Some((source_dir_block, source_dir_block + 1)))
     });
-    let attempt =
-        source.move_file_in_dir_lfn("STAGED.TMP", &root, "A Real Book.epub");
+    let attempt = source.move_file_in_dir_lfn("STAGED.TMP", &root, "A Real Book.epub");
     manager.device(|d| d.write_region.set(None));
 
     assert!(
         manager.device(|d| d.injected.get()) > 0,
         "no write was intercepted, so this proves nothing about the failure path"
     );
-    assert!(attempt.is_err(), "the move reported success despite failing");
+    assert!(
+        attempt.is_err(),
+        "the move reported success despite failing"
+    );
 
     // The destination must have been taken back off the disk.
     assert!(
@@ -144,9 +145,8 @@ fn a_move_that_cannot_retire_the_old_name_leaves_nothing_behind() {
 /// Recovery is to unlink the unwanted name, which leaves the chain alone.
 #[test]
 fn a_move_interrupted_between_its_two_writes_is_recoverable() {
-    let device = utils::FailRegion::new(
-        utils::make_block_device(utils::DISK_SOURCE).expect("disk image"),
-    );
+    let device =
+        utils::FailRegion::new(utils::make_block_device(utils::DISK_SOURCE).expect("disk image"));
     let manager: VolumeManager<_, _, 4, 4, 1> =
         VolumeManager::new_with_limits(device, utils::make_time_source(), 0xAA);
     let volume = manager.open_volume(VolumeIdx(1)).expect("volume");
@@ -177,7 +177,10 @@ fn a_move_interrupted_between_its_two_writes_is_recoverable() {
     manager.device(|d| d.fail_writes_from.set(None));
     manager.device(|d| d.write_region.set(None));
 
-    assert!(attempt.is_err(), "the move reported success despite failing");
+    assert!(
+        attempt.is_err(),
+        "the move reported success despite failing"
+    );
     assert_eq!(
         manager.device(|d| d.injected.get()),
         2,
@@ -255,7 +258,8 @@ fn the_moved_entry_carries_the_sources_chain_and_size() {
     staged.close().expect("close");
 
     let before = source.find_directory_entry("STAGED.TMP").expect("look up");
-    source.move_file_in_dir_lfn("STAGED.TMP", &root, "A Real Book.epub")
+    source
+        .move_file_in_dir_lfn("STAGED.TMP", &root, "A Real Book.epub")
         .expect("link");
     let after = root.find_directory_entry("AREALB~1.EPU").expect("look up");
 
@@ -493,7 +497,10 @@ fn moving_an_open_source_is_refused() {
     staged.close().expect("close");
     root.move_file_in_dir_lfn("STAGED.TMP", &root, "A Real Book.epub")
         .expect("link after close");
-    assert_eq!(read_all(&root, "AREALB~1.EPU"), b"the body that must survive");
+    assert_eq!(
+        read_all(&root, "AREALB~1.EPU"),
+        b"the body that must survive"
+    );
 }
 
 /// A directory carries a `..` entry naming its parent. Linking it under a
@@ -536,8 +543,7 @@ fn moving_across_volumes_is_refused() {
     staged.write(b"body on the other volume").expect("write");
     staged.close().expect("close");
 
-    let attempt =
-        fat16_root.move_file_in_dir_lfn("STAGED.TMP", &fat32_root, "A Real Book.epub");
+    let attempt = fat16_root.move_file_in_dir_lfn("STAGED.TMP", &fat32_root, "A Real Book.epub");
     assert!(
         matches!(attempt, Err(embedded_sdmmc::Error::Unsupported)),
         "linking across volumes must be refused, got {:?}",
@@ -579,8 +585,7 @@ fn moving_into_another_managers_directory_is_refused() {
     staged.write(b"belongs to A").expect("write");
     staged.close().expect("close");
 
-    let attempt =
-        root_a.move_file_in_dir_lfn("STAGED.TMP", &root_b, "A Real Book.epub");
+    let attempt = root_a.move_file_in_dir_lfn("STAGED.TMP", &root_b, "A Real Book.epub");
     assert!(
         matches!(attempt, Err(embedded_sdmmc::Error::BadHandle)),
         "a destination from another manager must be refused, got {:?}",
@@ -699,7 +704,11 @@ fn a_completed_move_leaves_no_second_name_to_strand() {
     let after = root.find_directory_entry("AREALB~1.EPU").expect("entry");
     assert_eq!(after.size, 0);
     assert!(
-        listing(&root).iter().filter(|n| *n == "AREALB~1.EPU").count() == 1,
+        listing(&root)
+            .iter()
+            .filter(|n| *n == "AREALB~1.EPU")
+            .count()
+            == 1,
         "exactly one entry should name this chain"
     );
 }
@@ -845,9 +854,8 @@ fn a_short_named_link_carries_the_sources_chain_and_size() {
 /// names remain, and unlinking the one not wanted recovers it.
 #[test]
 fn a_short_named_move_interrupted_between_its_two_writes_is_recoverable() {
-    let device = utils::FailRegion::new(
-        utils::make_block_device(utils::DISK_SOURCE).expect("disk image"),
-    );
+    let device =
+        utils::FailRegion::new(utils::make_block_device(utils::DISK_SOURCE).expect("disk image"));
     let manager: VolumeManager<_, _, 4, 4, 1> =
         VolumeManager::new_with_limits(device, utils::make_time_source(), 0xAA);
     let volume = manager.open_volume(VolumeIdx(1)).expect("volume");
@@ -872,7 +880,10 @@ fn a_short_named_move_interrupted_between_its_two_writes_is_recoverable() {
     manager.device(|d| d.fail_writes_from.set(None));
     manager.device(|d| d.write_region.set(None));
 
-    assert!(attempt.is_err(), "the move reported success despite failing");
+    assert!(
+        attempt.is_err(),
+        "the move reported success despite failing"
+    );
     assert_eq!(
         manager.device(|d| d.injected.get()),
         2,

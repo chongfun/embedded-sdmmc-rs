@@ -1081,7 +1081,9 @@ where
     {
         // Resolved once: it is needed twice, and `ShortFileName` is `Copy`
         // where the caller's type need not be.
-        let source_name = source_name.to_short_filename().map_err(Error::FilenameError)?;
+        let source_name = source_name
+            .to_short_filename()
+            .map_err(Error::FilenameError)?;
 
         let short_alias =
             self.link_file_in_dir_lfn(source_directory, source_name, dest_directory, long_name)?;
@@ -1233,7 +1235,9 @@ where
         }
         let volume_idx = data.get_volume_by_id(dest_volume_id)?;
 
-        let source_sfn = source_name.to_short_filename().map_err(Error::FilenameError)?;
+        let source_sfn = source_name
+            .to_short_filename()
+            .map_err(Error::FilenameError)?;
 
         // Read the source entry now, rather than trusting one the caller
         // captured earlier: this is what makes the checks below meaningful.
@@ -1305,8 +1309,12 @@ where
         N: ToShortFileName,
         M: ToShortFileName,
     {
-        let source_name = source_name.to_short_filename().map_err(Error::FilenameError)?;
-        let dest_name = dest_name.to_short_filename().map_err(Error::FilenameError)?;
+        let source_name = source_name
+            .to_short_filename()
+            .map_err(Error::FilenameError)?;
+        let dest_name = dest_name
+            .to_short_filename()
+            .map_err(Error::FilenameError)?;
 
         self.link_file_in_dir(source_directory, source_name, dest_directory, dest_name)?;
 
@@ -1358,8 +1366,12 @@ where
         }
         let volume_idx = data.get_volume_by_id(dest_volume_id)?;
 
-        let source_sfn = source_name.to_short_filename().map_err(Error::FilenameError)?;
-        let dest_sfn = dest_name.to_short_filename().map_err(Error::FilenameError)?;
+        let source_sfn = source_name
+            .to_short_filename()
+            .map_err(Error::FilenameError)?;
+        let dest_sfn = dest_name
+            .to_short_filename()
+            .map_err(Error::FilenameError)?;
 
         let source = match &data.open_volumes[volume_idx].volume_type {
             VolumeType::Fat(fat) => fat.find_directory_entry(
@@ -2301,11 +2313,7 @@ where
     ) -> Result<(), Error<D::Error>> {
         match &self.open_volumes[volume_idx].volume_type {
             VolumeType::Fat(fat) => {
-                if fat.name_is_taken(
-                    &mut self.block_cache,
-                    &self.open_dirs[directory_idx],
-                    name,
-                )? {
+                if fat.name_is_taken(&mut self.block_cache, &self.open_dirs[directory_idx], name)? {
                     return Err(Error::FileAlreadyExists);
                 }
             }

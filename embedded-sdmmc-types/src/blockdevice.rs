@@ -11,6 +11,7 @@
 /// This library does not support devices with a block size other than 512
 /// bytes.
 #[derive(Clone)]
+#[repr(transparent)]
 pub struct Block {
     /// The 512 bytes in this block (or sector).
     pub contents: [u8; Block::LEN],
@@ -30,6 +31,23 @@ impl Block {
         Block {
             contents: [0u8; Self::LEN],
         }
+    }
+}
+
+impl Block {
+    /// Views `bytes` as the blocks it holds, so a multi-block read can land
+    /// straight in a byte buffer. `None` unless its length is a whole number
+    /// of blocks.
+    pub fn slice_from_bytes_mut(bytes: &mut [u8]) -> Option<&mut [Block]> {
+        if bytes.len() % Self::LEN != 0 {
+            return None;
+        }
+        let count = bytes.len() / Self::LEN;
+        // SAFETY: `Block` is `repr(transparent)` over `[u8; LEN]`, so it has
+        // that array's size and alignment (1) and every bit pattern is valid.
+        // `count` blocks cover exactly `bytes`, which stay mutably borrowed
+        // for the lifetime of the result.
+        Some(unsafe { core::slice::from_raw_parts_mut(bytes.as_mut_ptr().cast::<Block>(), count) })
     }
 }
 
@@ -229,3 +247,26 @@ impl core::iter::Iterator for BlockIter {
 // End Of File
 //
 // ****************************************************************************
+
+#[cfg(test)]
+mod block_view_tests {
+    use super::Block;
+
+    #[test]
+    fn bytes_view_as_their_blocks() {
+        let mut bytes = [0u8; 2 * Block::LEN];
+        {
+            let blocks = Block::slice_from_bytes_mut(&mut bytes).expect("two whole blocks");
+            assert_eq!(blocks.len(), 2);
+            blocks[1].contents[0] = 7;
+            blocks[0].contents[Block::LEN - 1] = 9;
+        }
+        assert_eq!(bytes[Block::LEN], 7);
+        assert_eq!(bytes[Block::LEN - 1], 9);
+        assert!(Block::slice_from_bytes_mut(&mut bytes[..Block::LEN + 1]).is_none());
+        assert_eq!(
+            Block::slice_from_bytes_mut(&mut []).map(|b| b.len()),
+            Some(0)
+        );
+    }
+}

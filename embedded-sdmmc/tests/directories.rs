@@ -1266,9 +1266,8 @@ fn a_name_outside_ascii_survives_creation_and_can_be_reopened() {
 #[test]
 fn a_directory_that_cannot_be_created_is_not_left_behind() {
     const FOLDER: &str = "Science Fiction";
-    let device = utils::FailRegion::new(
-        utils::make_block_device(utils::DISK_SOURCE).expect("disk image"),
-    );
+    let device =
+        utils::FailRegion::new(utils::make_block_device(utils::DISK_SOURCE).expect("disk image"));
     let volume_mgr = embedded_sdmmc::VolumeManager::new(device, utils::make_time_source());
     let volume = volume_mgr
         .open_raw_volume(embedded_sdmmc::VolumeIdx(1))
@@ -1311,14 +1310,22 @@ fn a_directory_that_cannot_be_created_is_not_left_behind() {
 fn fat32_fat_region<D: embedded_sdmmc::BlockDevice>(device: &D) -> (u32, u32) {
     use embedded_sdmmc::{Block, BlockIdx};
     let at = |b: &Block, o: usize| -> u32 {
-        u32::from_le_bytes([b.contents[o], b.contents[o + 1], b.contents[o + 2], b.contents[o + 3]])
+        u32::from_le_bytes([
+            b.contents[o],
+            b.contents[o + 1],
+            b.contents[o + 2],
+            b.contents[o + 3],
+        ])
     };
     let mut mbr = [Block::new()];
     device.read(&mut mbr, BlockIdx(0)).ok();
     let start = at(&mbr[0], 446 + 16 + 8);
     let mut bpb = [Block::new()];
     device.read(&mut bpb, BlockIdx(start)).ok();
-    let reserved = u32::from(u16::from_le_bytes([bpb[0].contents[14], bpb[0].contents[15]]));
+    let reserved = u32::from(u16::from_le_bytes([
+        bpb[0].contents[14],
+        bpb[0].contents[15],
+    ]));
     let fats = u32::from(bpb[0].contents[16]);
     let per_fat = at(&bpb[0], 36);
     let fat_start = start + reserved;
@@ -1406,9 +1413,8 @@ fn a_directory_that_fails_while_being_laid_out_frees_its_cluster() {
             .cluster
     };
 
-    let device = utils::FailRegion::new(
-        utils::make_block_device(utils::DISK_SOURCE).expect("disk image"),
-    );
+    let device =
+        utils::FailRegion::new(utils::make_block_device(utils::DISK_SOURCE).expect("disk image"));
     let volume_mgr = embedded_sdmmc::VolumeManager::new(device, utils::make_time_source());
     let volume = volume_mgr
         .open_raw_volume(embedded_sdmmc::VolumeIdx(1))
