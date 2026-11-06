@@ -327,7 +327,17 @@ where
 
         // Select the CSD layout from the CSD_STRUCTURE field (bits 127:126);
         // note that it is independent from the Physical Layer v2.00+ (`card_type`).
-        csd::Csd::new(&csd_raw).map_err(|_| Error::RegisterReadError)
+        match csd::Csd::new(&csd_raw) {
+            Ok(csd) => Ok(csd),
+            // Some cards ship a wrong CRC7 in this register. With CRC on, the
+            // block already passed its CRC16, so the CRC7 is redundant. With
+            // CRC off it is the only check, so a wrong CRC7 still refuses.
+            Err(csd::CsdCreationError::Checksum) if self.options.use_crc => {
+                crate::warn!("CSD CRC7 is wrong; using the register, which passed CRC16");
+                csd::Csd::new_unchecked(&csd_raw).map_err(|_| Error::RegisterReadError)
+            }
+            Err(_) => Err(Error::RegisterReadError),
+        }
     }
 
     /// Read an arbitrary number of bytes from the card using the SD Card
@@ -816,6 +826,10 @@ mod tests {
         reject_block: Option<usize>,
         /// Blocks the card accepted.
         written: Vec<[u8; 512]>,
+        /// The register CMD9 returns.
+        csd: [u8; 16],
+        /// Send the CMD9 block with a CRC16 that does not match it.
+        corrupt_csd_crc16: bool,
     }
 
     /// A transfer the bus reported as failed.
@@ -844,6 +858,17 @@ mod tests {
             let arg = u32::from_be_bytes([frame[1], frame[2], frame[3], frame[4]]);
             self.commands.push(command);
             match command {
+                // CMD9: the CSD, as a 16-byte data block.
+                9 => {
+                    let mut crc = crc16(&self.csd);
+                    if self.corrupt_csd_crc16 {
+                        crc ^= 1;
+                    }
+                    self.outgoing.push_back(0x00);
+                    self.outgoing.push_back(DATA_START_BLOCK);
+                    self.outgoing.extend(self.csd);
+                    self.outgoing.extend(crc.to_be_bytes());
+                }
                 // CMD17: one block.
                 17 => {
                     self.outgoing.push_back(0x00);
@@ -980,6 +1005,8 @@ mod tests {
                 blocks_taken: 0,
                 reject_block: None,
                 written: Vec::new(),
+                csd: [0; 16],
+                corrupt_csd_crc16: false,
             },
             delayer: NoDelay,
             card_type: Some(CardType::SdhcSdxc),
@@ -1132,5 +1159,50 @@ mod tests {
             Err(Error::Transport)
         ));
         assert_eq!(card.spi.commands, [55, 23, 25, STOP_TRAN_TOKEN]);
+    }
+
+    /// A Lexar 633x 32 GB card's register. Every field is right and C_SIZE
+    /// gives the capacity a host reader reports, but the card stores 0x0a as
+    /// the CRC7 where 0x1b is correct.
+    const WRONG_CRC7_CSD: [u8; 16] = [
+        0x40, 0x0e, 0x00, 0x32, 0x5b, 0x59, 0x00, 0x00, 0xe9, 0x33, 0x7f, 0x80, 0x0a, 0x40, 0x00,
+        0x15,
+    ];
+    const WRONG_CRC7_CSD_BYTES: u64 = 31_299_993_600;
+
+    fn card_with_csd(csd: [u8; 16], use_crc: bool) -> SdCardInner<ScriptedCard, NoDelay> {
+        let mut card = card(None);
+        card.spi.csd = csd;
+        card.options.use_crc = use_crc;
+        card
+    }
+
+    #[test]
+    fn a_csd_with_a_wrong_crc7_is_read_when_its_crc16_checked_out() {
+        let mut card = card_with_csd(WRONG_CRC7_CSD, true);
+        assert_eq!(card.num_bytes().expect("CSD"), WRONG_CRC7_CSD_BYTES);
+    }
+
+    /// With CRC off the CRC7 is the only check, so read_csd still refuses
+    /// the register. The same register with its CRC7 fixed reads, so the
+    /// CRC7 alone refused it.
+    #[test]
+    fn a_csd_with_a_wrong_crc7_is_refused_with_crc_off() {
+        let mut card = card_with_csd(WRONG_CRC7_CSD, false);
+        assert!(matches!(card.num_bytes(), Err(Error::RegisterReadError)));
+
+        let mut fixed = WRONG_CRC7_CSD;
+        fixed[15] = (crc7(&fixed[..15]) << 1) | 1;
+        let mut card = card_with_csd(fixed, false);
+        assert_eq!(card.num_bytes().expect("CSD"), WRONG_CRC7_CSD_BYTES);
+    }
+
+    /// Accepting a wrong CRC7 depends on the CRC16, so read_data refuses a
+    /// block that fails it before read_csd checks the CRC7.
+    #[test]
+    fn a_csd_block_that_fails_its_crc16_is_refused() {
+        let mut card = card_with_csd(WRONG_CRC7_CSD, true);
+        card.spi.corrupt_csd_crc16 = true;
+        assert!(matches!(card.num_bytes(), Err(Error::CrcError(_, _))));
     }
 }
