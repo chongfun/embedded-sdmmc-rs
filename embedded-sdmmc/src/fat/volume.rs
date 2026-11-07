@@ -1852,6 +1852,8 @@ impl FatVolume {
                             fold_case,
                         ) {
                             debug!("No, didn't want that");
+                            state = SeqState::Waiting;
+                            pending_low = None;
                             return ControlFlow::Continue(());
                         }
                         if sequence == 1 {
@@ -1895,6 +1897,7 @@ impl FatVolume {
                                 this_sequence, this_csum
                             );
                             state = SeqState::Waiting;
+                            pending_low = None;
                             return ControlFlow::Continue(());
                         }
                         if !strip_lfn_words(
@@ -1904,6 +1907,8 @@ impl FatVolume {
                             fold_case,
                         ) {
                             debug!("No, didn't want that");
+                            state = SeqState::Waiting;
+                            pending_low = None;
                             return ControlFlow::Continue(());
                         }
                         if sequence == 1 {
@@ -2177,7 +2182,7 @@ impl FatVolume {
                     let block = block_cache
                         .read(this_fat_block_num)
                         .map_err(Error::DeviceError)?;
-                    while this_fat_ent_offset <= Block::LEN - 2 {
+                    while this_fat_ent_offset <= Block::LEN - 2 && current_cluster.0 < end_cluster.0 {
                         let fat_entry = LittleEndian::read_u16(
                             &block[this_fat_ent_offset..=this_fat_ent_offset + 1],
                         );
@@ -2206,7 +2211,7 @@ impl FatVolume {
                     let block = block_cache
                         .read(this_fat_block_num)
                         .map_err(Error::DeviceError)?;
-                    while this_fat_ent_offset <= Block::LEN - 4 {
+                    while this_fat_ent_offset <= Block::LEN - 4 && current_cluster.0 < end_cluster.0 {
                         let fat_entry = LittleEndian::read_u32(
                             &block[this_fat_ent_offset..=this_fat_ent_offset + 3],
                         ) & 0x0FFF_FFFF;
@@ -2419,10 +2424,50 @@ impl FatVolume {
         } else {
             self.next_free_cluster = Some(cluster);
         }
-        if let Some(ref mut free_clusters_count) = self.free_clusters_count {
-            *free_clusters_count += 1;
+        if let Some(count) = self.free_clusters_count {
+            self.free_clusters_count = count.checked_add(1).filter(|n| *n <= self.cluster_count);
         }
         Ok(true)
+    }
+
+    /// A valid beginning for a directory entry's chain, including an empty file.
+    pub(crate) fn is_chain_start(&self, cluster: ClusterId) -> bool {
+        cluster.0 < RESERVED_ENTRIES || self.is_data_cluster(cluster)
+    }
+
+    /// Free a chain for ordinary deletion. Not safe to resume after a power
+    /// cut: journaled reclamation instead records every cluster in advance
+    /// and uses [`Self::free_one_cluster`] on replay.
+    pub(crate) fn free_cluster_chain<D>(
+        &mut self,
+        block_cache: &mut BlockCache<D>,
+        first: ClusterId,
+    ) -> Result<(), Error<D::Error>>
+    where
+        D: BlockDevice,
+    {
+        if first.0 < RESERVED_ENTRIES {
+            return Ok(());
+        }
+        if !self.is_data_cluster(first) {
+            return Err(Error::BadCluster);
+        }
+        let mut at = first;
+        // Corrupt cyclic FAT chains must not hang the device indefinitely.
+        for _ in 0..self.cluster_count {
+            let next = match self.next_cluster(block_cache, at) {
+                Ok(cluster) if self.is_data_cluster(cluster) => Some(cluster),
+                Ok(_) => return Err(Error::BadCluster),
+                Err(Error::EndOfFile) => None,
+                Err(error) => return Err(error),
+            };
+            self.free_one_cluster(block_cache, at)?;
+            match next {
+                Some(cluster) => at = cluster,
+                None => return Ok(()),
+            }
+        }
+        Err(Error::UnterminatedFatChain)
     }
 
     pub(crate) fn truncate_cluster_chain<D>(

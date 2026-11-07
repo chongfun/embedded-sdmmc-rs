@@ -667,7 +667,7 @@ fn a_failed_delete_leaves_the_entry_wholly_there_or_wholly_gone() {
             d.write_region.set(Some((cluster_start, cluster_start + 8)));
             d.fail_write_number.set(Some(u32::MAX));
         });
-        root.delete_entry_in_dir(ALIAS).expect("delete");
+        root.unlink_entry_in_dir(ALIAS).expect("delete");
         manager.device(|d| d.writes_seen.get())
     };
     assert!(
@@ -697,7 +697,7 @@ fn a_failed_delete_leaves_the_entry_wholly_there_or_wholly_gone() {
             d.write_region.set(Some((cluster_start, cluster_start + 8)));
             d.fail_write_number.set(Some(failing_write));
         });
-        let outcome = root.delete_entry_in_dir(ALIAS);
+        let outcome = root.unlink_entry_in_dir(ALIAS);
         manager.device(|d| {
             d.write_region.set(None);
             d.fail_write_number.set(None);

@@ -207,7 +207,7 @@ fn a_move_interrupted_between_its_two_writes_is_recoverable() {
 
     // Finish the move by retiring the old name. The survivor is unharmed,
     // because unlinking a name does not touch the chain behind it.
-    root.delete_entry_in_dir("STAGED.TMP").expect("recover");
+    root.unlink_entry_in_dir("STAGED.TMP").expect("recover");
     assert_eq!(read_all(&root, "AREALB~1.EPU"), b"interrupted");
     assert!(matches!(
         root.find_directory_entry("STAGED.TMP"),
@@ -368,7 +368,7 @@ fn a_link_holds_the_chain_until_its_name_is_taken_away() {
 
     // Retiring one with an unlink leaves the other whole -- this is the half
     // the caller owns, and the only correct way to take it.
-    source.delete_entry_in_dir("STAGED.TMP").expect("unlink");
+    source.unlink_entry_in_dir("STAGED.TMP").expect("unlink");
     assert!(matches!(
         source.find_directory_entry("STAGED.TMP"),
         Err(embedded_sdmmc::Error::NotFound)
@@ -845,7 +845,7 @@ fn a_short_named_link_carries_the_sources_chain_and_size() {
     assert_eq!(read_all(&source, "STAGED.TMP"), vec![9u8; 1500]);
 
     // Finish the move by hand, the way a recovery does.
-    source.delete_entry_in_dir("STAGED.TMP").expect("unlink");
+    source.unlink_entry_in_dir("STAGED.TMP").expect("unlink");
     assert_eq!(read_all(&root, "S000.BIN"), vec![9u8; 1500]);
 }
 
@@ -896,7 +896,7 @@ fn a_short_named_move_interrupted_between_its_two_writes_is_recoverable() {
     let after = root.find_directory_entry("BOOK.BIN").expect("entry");
     assert_eq!(after.cluster, before.cluster, "one chain under two names");
 
-    root.delete_entry_in_dir("STAGED.TMP").expect("recover");
+    root.unlink_entry_in_dir("STAGED.TMP").expect("recover");
     assert_eq!(read_all(&root, "BOOK.BIN"), b"interrupted");
     assert!(matches!(
         root.find_directory_entry("STAGED.TMP"),
@@ -1269,7 +1269,7 @@ fn a_batched_move_cut_at_any_write_leaves_every_file_a_name() {
                 (Some(old), Some(new)) => {
                     assert_eq!(old.cluster, new.cluster, "cut {cut}: {name} has one chain");
                     twins_seen += 1;
-                    from.delete_entry_in_dir(*name).expect("recover");
+                    from.unlink_entry_in_dir(*name).expect("recover");
                 }
                 (Some(old), None) => assert_eq!(old.cluster, *cluster),
                 (None, Some(new)) => assert_eq!(new.cluster, *cluster),
@@ -1428,7 +1428,7 @@ fn a_batched_move_torn_inside_any_sector_leaves_every_file_a_name() {
                                 "write {number} cut {cut}: {name} has one chain"
                             );
                             twins_seen += 1;
-                            from.delete_entry_in_dir(*name).expect("recover");
+                            from.unlink_entry_in_dir(*name).expect("recover");
                         }
                         (Some(old), None) => assert_eq!(old.cluster, *cluster),
                         (None, Some(new)) => assert_eq!(new.cluster, *cluster),
@@ -1571,7 +1571,7 @@ fn a_short_move_torn_inside_its_sector_leaves_the_file_a_name() {
                     (Some(old), Some(new)) => {
                         assert_eq!(old.cluster, new.cluster, "write {number} cut {cut}");
                         twins_seen += 1;
-                        from.delete_entry_in_dir("BOOK.BIN").expect("recover");
+                        from.unlink_entry_in_dir("BOOK.BIN").expect("recover");
                     }
                     (Some(old), None) => {
                         assert_eq!(old.cluster, cluster);

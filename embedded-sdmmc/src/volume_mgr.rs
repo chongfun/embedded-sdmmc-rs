@@ -1031,7 +1031,7 @@ where
     /// chain with both names. That is the only way to observe it -- this call
     /// owns both halves, so no caller ever holds a handle while it is true.
     /// Recovery is to unlink the name you do not want with
-    /// [`Self::delete_entry_in_dir`], which takes the name away and leaves the
+    /// [`Self::unlink_entry_in_dir`], which takes the name away and leaves the
     /// chain alone. Do not open it and truncate it: that frees clusters the
     /// surviving name still points at. A caller that needs to know which name
     /// it meant to keep has to record that intent durably before starting.
@@ -1088,7 +1088,7 @@ where
         let short_alias =
             self.link_file_in_dir_lfn(source_directory, source_name, dest_directory, long_name)?;
 
-        match self.delete_entry_in_dir(source_directory, source_name) {
+        match self.unlink_entry_in_dir(source_directory, source_name) {
             Ok(()) => Ok(()),
             Err(error) => self.settle_failed_unlink(
                 source_directory,
@@ -1117,7 +1117,7 @@ where
             // and the caller is where a crash would have put them -- which the
             // returned error, and the documented recovery, already cover.
             Ok(_) => {
-                let _ = self.delete_entry_in_dir(dest_directory, dest_name);
+                let _ = self.unlink_entry_in_dir(dest_directory, dest_name);
                 Err(error)
             }
             // The unlink landed despite the error: the destination is the one
@@ -1149,7 +1149,7 @@ where
     /// - write, truncate, or otherwise change the file's length. Only the
     ///   entry written through is updated; the other is left describing a file
     ///   that is no longer there.
-    /// - delete and reclaim. [`Self::delete_entry_in_dir`] takes a name away
+    /// - delete and reclaim. [`Self::unlink_entry_in_dir`] takes a name away
     ///   without freeing the chain behind it, and is the only correct way to
     ///   retire one of a pair — reclaiming frees clusters the survivor still
     ///   points at.
@@ -1294,7 +1294,7 @@ where
     /// failed source unlink returns once the source has been looked for
     /// again, the state a crash between the two writes leaves and the
     /// recovery for it: unlink
-    /// the name you do not want with [`Self::delete_entry_in_dir`], and do not
+    /// the name you do not want with [`Self::unlink_entry_in_dir`], and do not
     /// truncate through either name. Fails as the long-name move does, with
     /// [`Error::FileAlreadyExists`] when `dest_name` is already answered to in
     /// the destination by any entry's long or short name.
@@ -1318,7 +1318,7 @@ where
 
         self.link_file_in_dir(source_directory, source_name, dest_directory, dest_name)?;
 
-        match self.delete_entry_in_dir(source_directory, source_name) {
+        match self.unlink_entry_in_dir(source_directory, source_name) {
             Ok(()) => Ok(()),
             // As the long-name move, including looking again before undoing.
             Err(error) => self.settle_failed_unlink(
@@ -1337,7 +1337,7 @@ where
     /// The short-named half of [`Self::move_file_in_dir`], under the contract
     /// of [`Self::link_file_in_dir_lfn`]: both names describe one chain, FAT
     /// keeps no count of that, and the caller owns taking one name away again
-    /// with [`Self::delete_entry_in_dir`]. Refuses what the long-name link
+    /// with [`Self::unlink_entry_in_dir`]. Refuses what the long-name link
     /// refuses. `dest_name` is checked against the destination's whole
     /// namespace, long names included, the way a created name is.
     pub fn link_file_in_dir<N, M>(
@@ -1434,7 +1434,7 @@ where
     /// and not a name over another file's cluster. [`Self::move_file_in_dir`]
     /// writes its one entry the same way. That is the state a cut
     /// [`Self::move_file_in_dir`] leaves, recovered the same way: unlink the
-    /// name you do not want with [`Self::delete_entry_in_dir`]. Unlike the
+    /// name you do not want with [`Self::unlink_entry_in_dir`]. Unlike the
     /// single move, a failed batch does not undo its links, because a caller
     /// recovering from crashes recovers from this too.
     ///
@@ -1672,11 +1672,40 @@ where
         Ok(())
     }
 
-    /// Delete a closed file or empty directory with the given filename, if it exists.
+    /// Delete a closed file or empty directory and free its cluster chain.
+    /// Standard upstream semantics: the data is no longer referenced after
+    /// the entry disappears. For a second name of a shared chain, use
+    /// [`Self::unlink_entry_in_dir`] instead.
     pub fn delete_entry_in_dir<N>(
         &self,
         directory: RawDirectory,
         name: N,
+    ) -> Result<(), Error<D::Error>>
+    where
+        N: ToShortFileName,
+    {
+        self.remove_entry_in_dir(directory, name, true)
+    }
+
+    /// Remove one name without freeing the cluster chain behind it.
+    /// For transactional moves and durable, separately journaled reclamation;
+    /// normal deletion must use [`Self::delete_entry_in_dir`].
+    pub fn unlink_entry_in_dir<N>(
+        &self,
+        directory: RawDirectory,
+        name: N,
+    ) -> Result<(), Error<D::Error>>
+    where
+        N: ToShortFileName,
+    {
+        self.remove_entry_in_dir(directory, name, false)
+    }
+
+    fn remove_entry_in_dir<N>(
+        &self,
+        directory: RawDirectory,
+        name: N,
+        reclaim: bool,
     ) -> Result<(), Error<D::Error>>
     where
         N: ToShortFileName,
@@ -1737,9 +1766,17 @@ where
         }
 
         let volume_idx = data.get_volume_by_id(parent_dir_info.raw_volume)?;
-        match &data.open_volumes[volume_idx].volume_type {
+        match &mut data.open_volumes[volume_idx].volume_type {
             VolumeType::Fat(fat) => {
-                fat.delete_directory_entry(&mut data.block_cache, parent_dir_info, &sfn)?
+                if reclaim && !fat.is_chain_start(dir_entry.cluster) {
+                    return Err(Error::BadCluster);
+                }
+                fat.delete_directory_entry(&mut data.block_cache, parent_dir_info, &sfn)?;
+                if reclaim {
+                    // Unlink before freeing. Power loss can leak storage, not
+                    // strand a still-listed file with freed data clusters.
+                    fat.free_cluster_chain(&mut data.block_cache, dir_entry.cluster)?;
+                }
             }
         }
 

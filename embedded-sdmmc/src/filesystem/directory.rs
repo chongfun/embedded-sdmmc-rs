@@ -406,16 +406,22 @@ where
     /// See [`VolumeManager::delete_entry_in_dir`] for details, except the
     /// directory given is this directory.
     ///
-    /// This removes the directory entry -- including its long-name chain --
-    /// and does *not* free the file's clusters. For an ordinary delete that
-    /// is a leak unless the caller truncates first; for the second half of a
-    /// move it is exactly right, since the chain still has another name.
+    /// Deletes the entry and reclaims its clusters, matching upstream.
+    /// For shared-chain move recovery use [`Self::unlink_entry_in_dir`].
     pub fn delete_entry_in_dir<N>(&self, name: N) -> Result<(), Error<D::Error>>
     where
         N: ToShortFileName,
     {
-        self.volume_mgr
-            .delete_entry_in_dir(self.raw_directory, name)
+        self.volume_mgr.delete_entry_in_dir(self.raw_directory, name)
+    }
+
+    /// Remove a directory entry without freeing its cluster chain.
+    /// For transactional moves and separately journaled reclamation only.
+    pub fn unlink_entry_in_dir<N>(&self, name: N) -> Result<(), Error<D::Error>>
+    where
+        N: ToShortFileName,
+    {
+        self.volume_mgr.unlink_entry_in_dir(self.raw_directory, name)
     }
 
     /// Create a new empty directory.

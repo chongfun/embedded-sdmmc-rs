@@ -216,7 +216,7 @@ fn freed_clusters_come_back_for_the_next_file() {
     let directory = root.to_directory(&manager);
     // Take the name away first, then the clusters: the ordering this
     // primitive exists to make possible.
-    directory.delete_entry_in_dir("BIG.DAT").expect("unlink");
+    directory.unlink_entry_in_dir("BIG.DAT").expect("unlink");
     for cluster in &chain {
         manager.free_cluster(volume, *cluster).expect("free");
     }
@@ -333,7 +333,7 @@ fn a_replay_repairs_a_half_mirrored_free() {
         .find_directory_entry("MIRROR.DAT")
         .expect("entry")
         .cluster;
-    directory.delete_entry_in_dir("MIRROR.DAT").expect("unlink");
+    directory.unlink_entry_in_dir("MIRROR.DAT").expect("unlink");
 
     // Cut the mirrored write in half: the primary FAT write lands, the
     // second one does not.
@@ -407,7 +407,7 @@ fn the_same_operations_are_reachable_from_a_directory() {
     );
 
     // And freeing, idempotently.
-    directory.delete_entry_in_dir("BIG.DAT").expect("unlink");
+    directory.unlink_entry_in_dir("BIG.DAT").expect("unlink");
     for cluster in &chain {
         directory.free_cluster(*cluster).expect("free");
         directory.free_cluster(*cluster).expect("free again");
@@ -435,5 +435,26 @@ fn a_directory_refuses_the_same_clusters_the_volume_does() {
             directory.next_cluster_in_chain(ClusterId::new(not_a_cluster)),
             Err(Error::BadCluster)
         ));
+    }
+}
+
+#[test]
+fn ordinary_delete_reclaims_the_entire_chain_on_both_fat_types() {
+    for volume_idx in [VolumeIdx(0), VolumeIdx(1)] {
+        let manager = manager();
+        let (volume, chain) = multi_cluster_file_on(&manager, volume_idx);
+        let root = manager.open_root_dir(volume).expect("root");
+        let directory = root.to_directory(&manager);
+        directory.delete_entry_in_dir("BIG.DAT").expect("delete");
+        assert!(matches!(
+            directory.find_directory_entry("BIG.DAT"),
+            Err(Error::NotFound)
+        ));
+        for cluster in chain {
+            assert!(matches!(
+                manager.next_cluster_in_chain(volume, cluster),
+                Err(Error::UnterminatedFatChain)
+            ), "cluster {cluster:?} was not freed");
+        }
     }
 }
