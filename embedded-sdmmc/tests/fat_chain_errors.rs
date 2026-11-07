@@ -784,13 +784,13 @@ fn failed_truncate_reclaim_persists_zero_length_before_fat_changes() {
             let before = directory.find_directory_entry(alias).expect("entry");
             assert!(before.size > 0);
 
-            // Reject the first FAT write after successfully publishing the
-            // directory's zero length. This is the exact failure that used
-            // to leave a nonzero length pointing at a shortened chain.
+            // Let both mirrored writes cut the head to EOF, then reject
+            // the first write freeing the tail. The directory must already
+            // have its zero length, even when reclamation fails partway.
             manager.device(|d| {
                 d.write_region.set(Some((fat_start, fat_end)));
                 d.writes_seen.set(0);
-                d.fail_write_number.set(Some(1));
+                d.fail_write_number.set(Some(3));
             });
             let result = if long_name {
                 directory.open_long_name_file_in_dir(LONG_NAME, Mode::ReadWriteTruncate)
@@ -802,7 +802,10 @@ fn failed_truncate_reclaim_persists_zero_length_before_fat_changes() {
                 "partition {partition}, long_name={long_name}: FAT failure not surfaced"
             );
             manager.device(|d| {
-                assert!(d.writes_seen.get() >= 1, "no FAT write was attempted");
+                assert!(
+                    d.writes_seen.get() >= 3,
+                    "tail reclamation write was not attempted"
+                );
                 d.write_region.set(None);
                 d.fail_write_number.set(None);
             });
@@ -810,10 +813,10 @@ fn failed_truncate_reclaim_persists_zero_length_before_fat_changes() {
             let after = directory.find_directory_entry(alias).expect("entry");
             assert_eq!(after.size, 0, "file length must already be zero");
             assert_eq!(after.cluster, before.cluster, "retained head changed");
-            // The rejected FAT update left the whole chain allocated.
+            // The head remains allocated and now ends the truncated file.
             assert!(matches!(
                 manager.next_cluster_in_chain(volume, before.cluster),
-                Ok(Some(_))
+                Ok(None)
             ));
         }
     }
