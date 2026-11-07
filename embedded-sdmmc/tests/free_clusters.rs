@@ -502,7 +502,7 @@ fn truncating_a_cyclic_tail_never_frees_the_retained_head() {
         let outcome = directory.open_file_in_dir("BIG.DAT", Mode::ReadWriteTruncate);
         assert!(
             matches!(outcome, Err(Error::UnterminatedFatChain)),
-            "partition {partition}: {outcome:?}"
+            "partition {partition}: corrupt tail was not rejected"
         );
         assert_eq!(
             directory.find_directory_entry("BIG.DAT").expect("entry").size,
@@ -534,7 +534,7 @@ fn truncating_a_self_loop_preserves_the_original_entry() {
         let outcome = directory.open_file_in_dir("BIG.DAT", Mode::ReadWriteTruncate);
         assert!(
             matches!(outcome, Err(Error::BadCluster)),
-            "partition {partition}: {outcome:?}"
+            "partition {partition}: self-loop was not rejected"
         );
         assert_eq!(
             directory.find_directory_entry("BIG.DAT").expect("entry").size,

@@ -734,3 +734,83 @@ fn a_failed_delete_leaves_the_entry_wholly_there_or_wholly_gone() {
         }
     }
 }
+
+#[test]
+fn failed_truncate_reclaim_persists_zero_length_before_fat_changes() {
+    const LONG_NAME: &str = "A long truncation test.epub";
+    const SHORT_NAME: &str = "TRUNC.DAT";
+
+    for partition in [0, 1] {
+        for long_name in [false, true] {
+            let disk = utils::make_block_device(utils::DISK_SOURCE).expect("disk image");
+            let (fat_start, fat_end) = fat_region(&disk, partition);
+            let device = utils::FailRegion::new(disk);
+            let manager: VolumeManager<_, _, 4, 4, 1> =
+                VolumeManager::new_with_limits(device, utils::make_time_source(), 0xAA);
+            let volume = manager.open_raw_volume(VolumeIdx(partition)).expect("volume");
+            let root = manager.open_root_dir(volume).expect("root");
+            let directory = root.to_directory(&manager);
+
+            let file = if long_name {
+                directory.create_file_in_dir_lfn(LONG_NAME).expect("create LFN")
+            } else {
+                directory
+                    .open_file_in_dir(SHORT_NAME, Mode::ReadWriteCreate)
+                    .expect("create SFN")
+            };
+            file.write(&[0xC5; 40_000]).expect("write file");
+            file.close().expect("close file");
+
+            let alias = if long_name {
+                let mut storage = [0u8; 256];
+                let mut buffer = embedded_sdmmc::LfnBuffer::new(&mut storage);
+                let mut alias = None;
+                directory
+                    .iterate_dir_lfn(&mut buffer, |entry, name| {
+                        if name == Some(LONG_NAME) {
+                            alias = Some(entry.name);
+                        }
+                        core::ops::ControlFlow::Continue(())
+                    })
+                    .expect("find LFN alias");
+                alias.expect("LFN alias")
+            } else {
+                embedded_sdmmc::ShortFileName::create_from_str(SHORT_NAME).expect("SFN")
+            };
+            let before = directory.find_directory_entry(alias).expect("entry");
+            assert!(before.size > 0);
+
+            // Reject the first FAT write after successfully publishing the
+            // directory's zero length. This is the exact failure that used
+            // to leave a nonzero length pointing at a shortened chain.
+            manager.device(|d| {
+                d.write_region.set(Some((fat_start, fat_end)));
+                d.writes_seen.set(0);
+                d.fail_write_number.set(Some(1));
+            });
+            let result = if long_name {
+                directory.open_long_name_file_in_dir(LONG_NAME, Mode::ReadWriteTruncate)
+            } else {
+                directory.open_file_in_dir(SHORT_NAME, Mode::ReadWriteTruncate)
+            };
+            assert!(
+                matches!(result, Err(embedded_sdmmc::Error::DeviceError(_))),
+                "partition {partition}, long_name={long_name}: FAT failure not surfaced"
+            );
+            manager.device(|d| {
+                assert!(d.writes_seen.get() >= 1, "no FAT write was attempted");
+                d.write_region.set(None);
+                d.fail_write_number.set(None);
+            });
+
+            let after = directory.find_directory_entry(alias).expect("entry");
+            assert_eq!(after.size, 0, "file length must already be zero");
+            assert_eq!(after.cluster, before.cluster, "retained head changed");
+            // The rejected FAT update left the whole chain allocated.
+            assert!(matches!(
+                manager.next_cluster_in_chain(volume, before.cluster),
+                Ok(Some(_))
+            ));
+        }
+    }
+}
