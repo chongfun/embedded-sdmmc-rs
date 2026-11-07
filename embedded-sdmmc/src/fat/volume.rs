@@ -594,16 +594,15 @@ impl FatVolume {
                 // FAT16 volumes don't have an info sector
             }
             FatSpecificInfo::Fat32(fat32_info) => {
-                if self.free_clusters_count.is_none() && self.next_free_cluster.is_none() {
-                    return Ok(());
-                }
                 trace!("Reading info sector");
                 let block = block_cache
                     .read_mut(fat32_info.info_location)
                     .map_err(Error::DeviceError)?;
-                if let Some(count) = self.free_clusters_count {
-                    block[488..492].copy_from_slice(&count.to_le_bytes());
-                }
+                // FSInfo uses 0xFFFF_FFFF to record an unknown free count.
+                // Leaving the previous value in place would resurrect stale
+                // accounting after a count overflows or is invalidated.
+                let count = self.free_clusters_count.unwrap_or(u32::MAX);
+                block[488..492].copy_from_slice(&count.to_le_bytes());
                 if let Some(next_free_cluster) = self.next_free_cluster {
                     block[492..496].copy_from_slice(&next_free_cluster.0.to_le_bytes());
                 }
@@ -2447,6 +2446,21 @@ impl FatVolume {
     where
         D: BlockDevice,
     {
+        self.free_cluster_chain_avoiding(block_cache, first, None)
+    }
+
+    /// Free a detached tail without ever freeing a cluster retained by the
+    /// directory entry. A cyclic tail can lead back to the head even after
+    /// its FAT entry has been cut to EOF.
+    fn free_cluster_chain_avoiding<D>(
+        &mut self,
+        block_cache: &mut BlockCache<D>,
+        first: ClusterId,
+        retained: Option<ClusterId>,
+    ) -> Result<(), Error<D::Error>>
+    where
+        D: BlockDevice,
+    {
         if first.0 < RESERVED_ENTRIES {
             return Ok(());
         }
@@ -2456,6 +2470,9 @@ impl FatVolume {
         let mut at = first;
         // Corrupt cyclic FAT chains must not hang the device indefinitely.
         for _ in 0..self.cluster_count {
+            if Some(at) == retained {
+                return Err(Error::UnterminatedFatChain);
+            }
             let next = match self.next_cluster(block_cache, at) {
                 Ok(cluster) if self.is_data_cluster(cluster) => Some(cluster),
                 Ok(_) => return Err(Error::BadCluster),
@@ -2471,31 +2488,48 @@ impl FatVolume {
         Err(Error::UnterminatedFatChain)
     }
 
-    /// Leave `cluster` as the final cluster, returning its tail to the FAT.
-    /// Validate the first link before modifying the chain, and never follow
-    /// a successor outside the volume's data clusters.
+    /// Inspect the first link without modifying the file. Truncation must
+    /// reject an invalid head or first successor before persisting a new
+    /// length; the rest of the chain is checked during reclamation.
+    pub(crate) fn truncation_tail<D>(
+        &self,
+        block_cache: &mut BlockCache<D>,
+        head: ClusterId,
+    ) -> Result<Option<ClusterId>, Error<D::Error>>
+    where
+        D: BlockDevice,
+    {
+        if head.0 < RESERVED_ENTRIES {
+            return Ok(None);
+        }
+        if !self.is_data_cluster(head) {
+            return Err(Error::BadCluster);
+        }
+        match self.next_cluster(block_cache, head) {
+            Ok(next) if self.is_data_cluster(next) && next != head => Ok(Some(next)),
+            Ok(_) => Err(Error::BadCluster),
+            Err(Error::EndOfFile) => Ok(None),
+            Err(error) => Err(error),
+        }
+    }
+
+    /// The directory entry already records a zero length before this call:
+    /// if a FAT update fails, no live file advertises the detached tail.
+    /// Never free the retained head, even when a corrupt tail links back to it.
     pub(crate) fn truncate_cluster_chain<D>(
         &mut self,
         block_cache: &mut BlockCache<D>,
-        cluster: ClusterId,
+        head: ClusterId,
+        tail: Option<ClusterId>,
     ) -> Result<(), Error<D::Error>>
     where
         D: BlockDevice,
     {
-        if cluster.0 < RESERVED_ENTRIES {
-            return Ok(());
+        if let Some(tail) = tail {
+            self.update_fat(block_cache, head, ClusterId::END_OF_FILE)?;
+            self.free_cluster_chain_avoiding(block_cache, tail, Some(head))?;
         }
-        if !self.is_data_cluster(cluster) {
-            return Err(Error::BadCluster);
-        }
-        let next = match self.next_cluster(block_cache, cluster) {
-            Ok(next) if self.is_data_cluster(next) => next,
-            Ok(_) => return Err(Error::BadCluster),
-            Err(Error::EndOfFile) => return Ok(()),
-            Err(error) => return Err(error),
-        };
-        self.update_fat(block_cache, cluster, ClusterId::END_OF_FILE)?;
-        self.free_cluster_chain(block_cache, next)
+        Ok(())
     }
 
     /// Writes a Directory Entry to the disk

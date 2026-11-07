@@ -461,3 +461,119 @@ fn ordinary_delete_reclaims_the_entire_chain_on_both_fat_types() {
         }
     }
 }
+
+fn set_fat_link(manager: &Manager, partition: usize, from: ClusterId, to: ClusterId) {
+    manager.device(|device| {
+        let (start, blocks_per_fat, copies) = fat_layout(device, partition);
+        let bytes_per_entry = if partition == 0 { 2 } else { 4 };
+        let offset = from.value() * bytes_per_entry;
+        for copy in 0..copies {
+            let block_idx = BlockIdx(start + copy * blocks_per_fat + offset / Block::LEN_U32);
+            let entry_offset = (offset % Block::LEN_U32) as usize;
+            let mut block = [Block::new()];
+            device.read(&mut block, block_idx).expect("read FAT");
+            if partition == 0 {
+                block[0].contents[entry_offset..entry_offset + 2]
+                    .copy_from_slice(&(to.value() as u16).to_le_bytes());
+            } else {
+                let previous = u32_at(&block[0], entry_offset);
+                let value = (previous & 0xF000_0000) | (to.value() & 0x0FFF_FFFF);
+                block[0].contents[entry_offset..entry_offset + 4]
+                    .copy_from_slice(&value.to_le_bytes());
+            }
+            device.write(&block, block_idx).expect("write FAT");
+        }
+    });
+}
+
+#[test]
+fn truncating_a_cyclic_tail_never_frees_the_retained_head() {
+    for partition in [0, 1] {
+        let manager = manager();
+        let (volume, chain) = multi_cluster_file_on(&manager, VolumeIdx(partition));
+        let head = chain[0];
+        let second = chain[1];
+        // Corrupt the second link to loop back to the file's first cluster.
+        set_fat_link(&manager, partition, second, head);
+        let root = manager.open_root_dir(volume).expect("root");
+        let directory = root.to_directory(&manager);
+        // Directory lookup evicts any stale FAT sector from the block cache.
+        assert!(directory.find_directory_entry("BIG.DAT").is_ok());
+        let outcome = directory.open_file_in_dir("BIG.DAT", Mode::ReadWriteTruncate);
+        assert!(
+            matches!(outcome, Err(Error::UnterminatedFatChain)),
+            "partition {partition}: {outcome:?}"
+        );
+        assert_eq!(
+            directory.find_directory_entry("BIG.DAT").expect("entry").size,
+            0
+        );
+        assert!(matches!(
+            manager.next_cluster_in_chain(volume, head),
+            Ok(None)
+        ));
+        // The retained head can still be used by the truncated file.
+        let file = directory
+            .open_file_in_dir("BIG.DAT", Mode::ReadWriteAppend)
+            .expect("open truncated file");
+        file.write(&[0x5A; 512]).expect("write retained head");
+        file.close().expect("close");
+    }
+}
+
+#[test]
+fn truncating_a_self_loop_preserves_the_original_entry() {
+    for partition in [0, 1] {
+        let manager = manager();
+        let (volume, chain) = multi_cluster_file_on(&manager, VolumeIdx(partition));
+        let head = chain[0];
+        set_fat_link(&manager, partition, head, head);
+        let root = manager.open_root_dir(volume).expect("root");
+        let directory = root.to_directory(&manager);
+        let original_size = directory.find_directory_entry("BIG.DAT").expect("entry").size;
+        let outcome = directory.open_file_in_dir("BIG.DAT", Mode::ReadWriteTruncate);
+        assert!(
+            matches!(outcome, Err(Error::BadCluster)),
+            "partition {partition}: {outcome:?}"
+        );
+        assert_eq!(
+            directory.find_directory_entry("BIG.DAT").expect("entry").size,
+            original_size
+        );
+        assert_eq!(
+            manager.next_cluster_in_chain(volume, head).expect("walk"),
+            Some(head)
+        );
+    }
+}
+
+#[test]
+fn invalidated_fat32_free_count_is_persisted_as_unknown() {
+    let disk = utils::make_block_device(utils::DISK_SOURCE).expect("disk image");
+    let mut block = [Block::new()];
+    disk.read(&mut block, BlockIdx(0)).expect("MBR");
+    let partition_start = u32_at(&block[0], 446 + 16 + 8);
+    disk.read(&mut block, BlockIdx(partition_start)).expect("FAT32 BPB");
+    let reserved = u16_at(&block[0], 14);
+    let fat_copies = u32::from(block[0].contents[16]);
+    let fat_blocks = u32_at(&block[0], 36);
+    let data_blocks = u32_at(&block[0], 32) - reserved - fat_copies * fat_blocks;
+    let cluster_count = data_blocks / u32::from(block[0].contents[13]);
+    let root_cluster = ClusterId::new(u32_at(&block[0], 44));
+    let info_idx = BlockIdx(partition_start + u16_at(&block[0], 48));
+    disk.read(&mut block, info_idx).expect("FSInfo");
+    // An advisory count at the maximum legal value is valid on load but
+    // must become unknown when one allocated cluster is freed.
+    block[0].contents[488..492].copy_from_slice(&cluster_count.to_le_bytes());
+    disk.write(&block, info_idx).expect("FSInfo update");
+
+    let manager: Manager = VolumeManager::new_with_limits(disk, utils::make_time_source(), 0xAA);
+    let volume = manager.open_raw_volume(VolumeIdx(1)).expect("FAT32");
+    manager.free_cluster(volume, root_cluster).expect("invalidate count");
+    manager.close_volume(volume).expect("close volume");
+    manager.device(|device| {
+        let mut block = [Block::new()];
+        device.read(&mut block, info_idx).expect("read FSInfo");
+        assert_eq!(&block[0].contents[488..492], &u32::MAX.to_le_bytes());
+    });
+}

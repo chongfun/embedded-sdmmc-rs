@@ -718,17 +718,24 @@ where
                             entry: dir_entry,
                             dirty: false,
                         };
-                        match &mut data.open_volumes[volume_idx].volume_type {
-                            VolumeType::Fat(fat) => fat.truncate_cluster_chain(
-                                &mut data.block_cache,
-                                file.entry.cluster,
-                            )?,
+                        let tail = match &data.open_volumes[volume_idx].volume_type {
+                            VolumeType::Fat(fat) => {
+                                fat.truncation_tail(&mut data.block_cache, file.entry.cluster)?
+                            }
                         };
                         file.update_length(0);
-                        match &data.open_volumes[volume_idx].volume_type {
+                        match &mut data.open_volumes[volume_idx].volume_type {
                             VolumeType::Fat(fat) => {
                                 file.entry.mtime = self.time_source.get_timestamp();
+                                // Publish the shorter length before detaching or
+                                // freeing any clusters. A failed FAT write cannot
+                                // leave a live entry claiming freed data.
                                 fat.write_entry_to_disk(&mut data.block_cache, &file.entry)?;
+                                fat.truncate_cluster_chain(
+                                    &mut data.block_cache,
+                                    file.entry.cluster,
+                                    tail,
+                                )?;
                             }
                         };
 
@@ -866,17 +873,24 @@ where
                             entry: dir_entry,
                             dirty: false,
                         };
-                        match &mut data.open_volumes[volume_idx].volume_type {
-                            VolumeType::Fat(fat) => fat.truncate_cluster_chain(
-                                &mut data.block_cache,
-                                file.entry.cluster,
-                            )?,
+                        let tail = match &data.open_volumes[volume_idx].volume_type {
+                            VolumeType::Fat(fat) => {
+                                fat.truncation_tail(&mut data.block_cache, file.entry.cluster)?
+                            }
                         };
                         file.update_length(0);
-                        match &data.open_volumes[volume_idx].volume_type {
+                        match &mut data.open_volumes[volume_idx].volume_type {
                             VolumeType::Fat(fat) => {
                                 file.entry.mtime = self.time_source.get_timestamp();
+                                // Publish the shorter length before detaching or
+                                // freeing any clusters. A failed FAT write cannot
+                                // leave a live entry claiming freed data.
                                 fat.write_entry_to_disk(&mut data.block_cache, &file.entry)?;
+                                fat.truncate_cluster_chain(
+                                    &mut data.block_cache,
+                                    file.entry.cluster,
+                                    tail,
+                                )?;
                             }
                         };
 
