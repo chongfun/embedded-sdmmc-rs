@@ -505,7 +505,10 @@ fn truncating_a_cyclic_tail_never_frees_the_retained_head() {
             "partition {partition}: corrupt tail was not rejected"
         );
         assert_eq!(
-            directory.find_directory_entry("BIG.DAT").expect("entry").size,
+            directory
+                .find_directory_entry("BIG.DAT")
+                .expect("entry")
+                .size,
             0
         );
         assert!(matches!(
@@ -530,14 +533,20 @@ fn truncating_a_self_loop_preserves_the_original_entry() {
         set_fat_link(&manager, partition, head, head);
         let root = manager.open_root_dir(volume).expect("root");
         let directory = root.to_directory(&manager);
-        let original_size = directory.find_directory_entry("BIG.DAT").expect("entry").size;
+        let original_size = directory
+            .find_directory_entry("BIG.DAT")
+            .expect("entry")
+            .size;
         let outcome = directory.open_file_in_dir("BIG.DAT", Mode::ReadWriteTruncate);
         assert!(
             matches!(outcome, Err(Error::BadCluster)),
             "partition {partition}: self-loop was not rejected"
         );
         assert_eq!(
-            directory.find_directory_entry("BIG.DAT").expect("entry").size,
+            directory
+                .find_directory_entry("BIG.DAT")
+                .expect("entry")
+                .size,
             original_size
         );
         assert_eq!(
@@ -553,7 +562,8 @@ fn invalidated_fat32_free_count_is_persisted_as_unknown() {
     let mut block = [Block::new()];
     disk.read(&mut block, BlockIdx(0)).expect("MBR");
     let partition_start = u32_at(&block[0], 446 + 16 + 8);
-    disk.read(&mut block, BlockIdx(partition_start)).expect("FAT32 BPB");
+    disk.read(&mut block, BlockIdx(partition_start))
+        .expect("FAT32 BPB");
     let reserved = u16_at(&block[0], 14);
     let fat_copies = u32::from(block[0].contents[16]);
     let fat_blocks = u32_at(&block[0], 36);
@@ -569,7 +579,9 @@ fn invalidated_fat32_free_count_is_persisted_as_unknown() {
 
     let manager: Manager = VolumeManager::new_with_limits(disk, utils::make_time_source(), 0xAA);
     let volume = manager.open_raw_volume(VolumeIdx(1)).expect("FAT32");
-    manager.free_cluster(volume, root_cluster).expect("invalidate count");
+    manager
+        .free_cluster(volume, root_cluster)
+        .expect("invalidate count");
     manager.close_volume(volume).expect("close volume");
     manager.device(|device| {
         let mut block = [Block::new()];

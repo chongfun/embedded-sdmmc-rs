@@ -747,12 +747,16 @@ fn failed_truncate_reclaim_persists_zero_length_before_fat_changes() {
             let device = utils::FailRegion::new(disk);
             let manager: VolumeManager<_, _, 4, 4, 1> =
                 VolumeManager::new_with_limits(device, utils::make_time_source(), 0xAA);
-            let volume = manager.open_raw_volume(VolumeIdx(partition)).expect("volume");
+            let volume = manager
+                .open_raw_volume(VolumeIdx(partition))
+                .expect("volume");
             let root = manager.open_root_dir(volume).expect("root");
             let directory = root.to_directory(&manager);
 
             let file = if long_name {
-                directory.create_file_in_dir_lfn(LONG_NAME).expect("create LFN")
+                directory
+                    .create_file_in_dir_lfn(LONG_NAME)
+                    .expect("create LFN")
             } else {
                 directory
                     .open_file_in_dir(SHORT_NAME, Mode::ReadWriteCreate)
