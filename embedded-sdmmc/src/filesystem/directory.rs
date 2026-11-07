@@ -412,7 +412,8 @@ where
     where
         N: ToShortFileName,
     {
-        self.volume_mgr.delete_entry_in_dir(self.raw_directory, name)
+        self.volume_mgr
+            .delete_entry_in_dir(self.raw_directory, name)
     }
 
     /// Remove a directory entry without freeing its cluster chain.
@@ -421,7 +422,8 @@ where
     where
         N: ToShortFileName,
     {
-        self.volume_mgr.unlink_entry_in_dir(self.raw_directory, name)
+        self.volume_mgr
+            .unlink_entry_in_dir(self.raw_directory, name)
     }
 
     /// Create a new empty directory.

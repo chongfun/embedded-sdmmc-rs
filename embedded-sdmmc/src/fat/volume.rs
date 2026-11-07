@@ -2426,9 +2426,7 @@ impl FatVolume {
             self.next_free_cluster = Some(cluster);
         }
         if let Some(count) = self.free_clusters_count {
-            self.free_clusters_count = count
-                .checked_add(1)
-                .filter(|n| *n <= self.cluster_count);
+            self.free_clusters_count = count.checked_add(1).filter(|n| *n <= self.cluster_count);
         }
         Ok(true)
     }

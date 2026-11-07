@@ -451,10 +451,13 @@ fn ordinary_delete_reclaims_the_entire_chain_on_both_fat_types() {
             Err(Error::NotFound)
         ));
         for cluster in chain {
-            assert!(matches!(
-                manager.next_cluster_in_chain(volume, cluster),
-                Err(Error::UnterminatedFatChain)
-            ), "cluster {cluster:?} was not freed");
+            assert!(
+                matches!(
+                    manager.next_cluster_in_chain(volume, cluster),
+                    Err(Error::UnterminatedFatChain)
+                ),
+                "cluster {cluster:?} was not freed"
+            );
         }
     }
 }
