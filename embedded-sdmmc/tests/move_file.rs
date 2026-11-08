@@ -1821,6 +1821,8 @@ fn short_slot_reuse_never_adopts_an_orphaned_lfn() {
                 let manager = manager();
                 let volume = manager.open_volume(VolumeIdx(partition)).expect("volume");
                 let root = volume.open_root_dir().expect("root");
+                root.make_dir_in_dir("DEST").expect("fresh destination");
+                let dest = root.open_dir("DEST").expect("destination");
                 let source = root.open_dir("TEST").expect("source");
 
                 if across_block {
@@ -1829,11 +1831,11 @@ fn short_slot_reuse_never_adopts_an_orphaned_lfn() {
                     let mut aligned = false;
                     for n in 0..32 {
                         let filler = format!("F{n:07}.TMP");
-                        let file = root
+                        let file = dest
                             .open_file_in_dir(filler.as_str(), Mode::ReadWriteCreate)
                             .expect("filler");
                         file.close().expect("close filler");
-                        if root
+                        if dest
                             .find_directory_entry(filler.as_str())
                             .unwrap()
                             .entry_offset
@@ -1847,14 +1849,14 @@ fn short_slot_reuse_never_adopts_an_orphaned_lfn() {
                 }
 
                 let old_name = "Lost book volume.epub";
-                root.create_file_in_dir_lfn(old_name)
+                dest.create_file_in_dir_lfn(old_name)
                     .expect("old long name")
                     .close()
                     .expect("close old long name");
                 let mut storage = [0u8; 128];
                 let mut buffer = embedded_sdmmc::LfnBuffer::new(&mut storage);
                 let mut alias = None;
-                root.iterate_dir_lfn(&mut buffer, |entry, long| {
+                dest.iterate_dir_lfn(&mut buffer, |entry, long| {
                     if long == Some(old_name) {
                         alias = Some(entry.name);
                     }
@@ -1862,7 +1864,7 @@ fn short_slot_reuse_never_adopts_an_orphaned_lfn() {
                 })
                 .expect("find old alias");
                 let alias = alias.expect("old alias");
-                let old = root.find_directory_entry(alias).expect("old entry");
+                let old = dest.find_directory_entry(alias).expect("old entry");
                 if across_block {
                     assert_eq!(old.entry_offset, 0, "LFN spans a sector boundary");
                 }
@@ -1893,31 +1895,31 @@ fn short_slot_reuse_never_adopts_an_orphaned_lfn() {
 
                 if batched {
                     let fates = source
-                        .move_files_in_dir(&root, &[collision.as_str()])
+                        .move_files_in_dir(&dest, &[collision.as_str()])
                         .expect("batch move");
                     assert_eq!(&fates[..], &[MoveFate::Moved]);
                 } else {
-                    let file = root
+                    let file = dest
                         .open_file_in_dir(collision.as_str(), Mode::ReadWriteCreate)
                         .expect("short create");
                     file.write(b"new content").expect("write file");
                     file.close().expect("close file");
                 }
 
-                let replacement = root
+                let replacement = dest
                     .find_directory_entry(collision.as_str())
                     .expect("replacement");
                 assert_eq!(replacement.entry_block, old.entry_block);
                 assert_eq!(replacement.entry_offset, old.entry_offset);
-                assert_eq!(read_all(&root, collision.as_str()), b"new content");
+                assert_eq!(read_all(&dest, collision.as_str()), b"new content");
                 assert!(
                     matches!(
-                        root.open_long_name_file_in_dir(old_name, Mode::ReadWriteTruncate),
+                        dest.open_long_name_file_in_dir(old_name, Mode::ReadWriteTruncate),
                         Err(embedded_sdmmc::Error::NotFound)
                     ),
                     "partition={partition}, batched={batched}, across_block={across_block}: orphan LFN adopted replacement"
                 );
-                assert_eq!(read_all(&root, collision.as_str()), b"new content");
+                assert_eq!(read_all(&dest, collision.as_str()), b"new content");
             }
         }
     }
