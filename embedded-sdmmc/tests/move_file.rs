@@ -1764,8 +1764,10 @@ fn a_batched_move_ignores_an_orphaned_lfn_across_a_deleted_slot() {
             &[MoveFate::AlreadyExists]
         );
 
-        let collision = (0..10_000)
-            .map(|n| format!("C{n:07}.DAT"))
+        // Vary four hexadecimal digits rather than only decimal digits:
+        // this spans all 256 FAT LFN checksum values deterministically.
+        let collision = (0..=0xFFFF)
+            .map(|n| format!("C{n:07X}.DAT"))
             .find(|candidate| {
                 let short = ShortFileName::create_from_str(candidate).expect("short name");
                 short != alias && short.csum() == alias.csum()
