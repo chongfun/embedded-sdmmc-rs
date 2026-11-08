@@ -2,7 +2,7 @@
 
 use std::ops::ControlFlow;
 
-use embedded_sdmmc::{LfnBuffer, Mode, ShortFileName};
+use embedded_sdmmc::{Block, BlockDevice, LfnBuffer, Mode, ShortFileName};
 
 mod utils;
 
@@ -1563,5 +1563,107 @@ fn a_directory_that_cannot_tell_whether_its_name_landed_keeps_its_cluster() {
             kept, next,
             "long={long}: a live folder's cluster was handed out again"
         );
+    }
+}
+
+#[test]
+fn orphaned_lfn_never_matches_a_later_short_entry_with_colliding_checksum() {
+    // A torn/unlinked short entry can leave LFN slots behind. The following
+    // short entry may coincidentally have the same 8-bit LFN checksum.
+    for partition in [0, 1] {
+        for deleted_short in [false, true] {
+            let manager = embedded_sdmmc::VolumeManager::new(
+                utils::make_block_device(utils::DISK_SOURCE).expect("disk image"),
+                utils::make_time_source(),
+            );
+            let volume = manager
+                .open_raw_volume(embedded_sdmmc::VolumeIdx(partition))
+                .expect("volume");
+            let root = manager.open_root_dir(volume).expect("root");
+            let long_name = "A deliberately long orphaned test book.epub";
+            manager
+                .create_file_in_dir_lfn(root, long_name)
+                .expect("create LFN")
+                .to_file(&manager)
+                .close()
+                .expect("close LFN");
+
+            let mut storage = [0u8; 256];
+            let mut buffer = LfnBuffer::new(&mut storage);
+            let mut alias = None;
+            manager
+                .iterate_dir_lfn(root, &mut buffer, |entry, name| {
+                    if name == Some(long_name) {
+                        alias = Some(entry.name);
+                    }
+                    ControlFlow::Continue(())
+                })
+                .expect("find alias");
+            let alias = alias.expect("LFN alias");
+
+            // Find a different short name whose checksum collides with the
+            // LFN's real alias, so rejecting the lookup cannot be attributed
+            // to checksum inequality.
+            let collision = (0..10_000)
+                .map(|n| format!("C{n:07}.DAT"))
+                .find(|name| {
+                    let short = ShortFileName::create_from_str(name).expect("short name");
+                    short != alias && short.csum() == alias.csum()
+                })
+                .expect("checksum collision");
+            let victim = manager
+                .open_file_in_dir(root, collision.as_str(), Mode::ReadWriteCreate)
+                .expect("create collision");
+            manager.write(victim, b"untouched").expect("write collision");
+            manager.close_file(victim).expect("close collision");
+
+            let entry = manager.find_directory_entry(root, alias).expect("original");
+            let replacement = ShortFileName::create_from_str("OTHER.DAT").expect("replacement");
+            assert_ne!(replacement.csum(), alias.csum());
+            manager.device(|disk| {
+                let mut sector = [Block::new()];
+                disk.read(&mut sector, entry.entry_block).expect("read entry");
+                let offset = entry.entry_offset as usize;
+                if deleted_short {
+                    sector[0].contents[offset] = 0xE5;
+                } else {
+                    // A surviving but unrelated short entry must consume
+                    // and reset the preceding LFN lookup state.
+                    sector[0].contents[offset..offset + 11]
+                        .copy_from_slice(b"OTHER   DAT");
+                }
+                disk.write(&sector, entry.entry_block).expect("corrupt entry");
+            });
+
+            assert!(
+                matches!(
+                    manager.open_long_name_file_in_dir(root, long_name, Mode::ReadWriteTruncate),
+                    Err(embedded_sdmmc::Error::NotFound)
+                ),
+                "partition {partition}, deleted_short={deleted_short}: orphaned name opened another file"
+            );
+
+            let mut buffer = LfnBuffer::new(&mut storage);
+            let mut victim_name = None;
+            manager
+                .iterate_dir_lfn(root, &mut buffer, |entry, name| {
+                    if entry.name.to_string() == collision {
+                        victim_name = name.map(str::to_owned);
+                    }
+                    ControlFlow::Continue(())
+                })
+                .expect("list directory");
+            assert_eq!(victim_name, None, "orphan LFN attached to a different file");
+
+            let victim = manager
+                .open_file_in_dir(root, collision.as_str(), Mode::ReadOnly)
+                .expect("victim still exists");
+            let mut bytes = [0u8; 9];
+            manager.read(victim, &mut bytes).expect("read victim");
+            assert_eq!(&bytes, b"untouched");
+            manager.close_file(victim).expect("close victim");
+            manager.close_dir(root).expect("close root");
+            manager.close_volume(volume).expect("close volume");
+        }
     }
 }

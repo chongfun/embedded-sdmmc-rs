@@ -589,3 +589,39 @@ fn invalidated_fat32_free_count_is_persisted_as_unknown() {
         assert_eq!(&block[0].contents[488..492], &u32::MAX.to_le_bytes());
     });
 }
+
+#[test]
+fn closing_unchanged_fat32_fsinfo_does_not_write_to_the_card() {
+    for known_count in [false, true] {
+        let disk = utils::make_block_device(utils::DISK_SOURCE).expect("disk image");
+        let mut block = [Block::new()];
+        disk.read(&mut block, BlockIdx(0)).expect("MBR");
+        let start = u32_at(&block[0], 446 + 16 + 8);
+        disk.read(&mut block, BlockIdx(start)).expect("FAT32 BPB");
+        let info_block = BlockIdx(start + u16_at(&block[0], 48));
+        disk.read(&mut block, info_block).expect("FSInfo");
+        let count = if known_count { 42u32 } else { u32::MAX };
+        block[0].contents[488..492].copy_from_slice(&count.to_le_bytes());
+        block[0].contents[492..496].copy_from_slice(&u32::MAX.to_le_bytes());
+        disk.write(&block, info_block).expect("set up FSInfo");
+
+        let manager: VolumeManager<_, _, 4, 4, 1> = VolumeManager::new_with_limits(
+            utils::FailRegion::new(disk),
+            utils::make_time_source(),
+            0xAA,
+        );
+        let volume = manager.open_raw_volume(VolumeIdx(1)).expect("volume");
+        manager.device(|device| {
+            device.write_region.set(Some((info_block.0, info_block.0 + 1)));
+            device.fail_write_number.set(Some(1));
+        });
+        manager.close_volume(volume).expect("close untouched FAT32");
+        manager.device(|device| {
+            assert_eq!(
+                device.writes_seen.get(),
+                0,
+                "known_count={known_count}: FSInfo written without any changes"
+            );
+        });
+    }
+}
