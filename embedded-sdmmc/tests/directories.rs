@@ -1683,19 +1683,24 @@ fn malformed_lfn_start_sequences_do_not_panic_or_resolve() {
                 .open_raw_volume(embedded_sdmmc::VolumeIdx(partition))
                 .expect("volume");
             let root = manager.open_root_dir(volume).expect("root");
-            let long_name = "Malformed sequence test book.epub";
+            manager.make_dir_in_dir(root, "MALDIR").expect("fresh directory");
+            let dir = manager.open_dir(root, "MALDIR").expect("open directory");
+
+            // In a freshly created directory, '.' and '..' occupy slots
+            // zero and one. This one-entry LFN is the third slot, directly
+            // before its short alias, in the same sector.
+            let long_name = "Bad Seq.txt";
             manager
-                .create_file_in_dir_lfn(root, long_name)
+                .create_file_in_dir_lfn(dir, long_name)
                 .expect("create")
                 .to_file(&manager)
                 .close()
                 .expect("close");
-
-            let mut storage = [0u8; 128];
+            let mut storage = [0u8; 64];
             let mut buffer = LfnBuffer::new(&mut storage);
             let mut alias = None;
             manager
-                .iterate_dir_lfn(root, &mut buffer, |entry, long| {
+                .iterate_dir_lfn(dir, &mut buffer, |entry, long| {
                     if long == Some(long_name) {
                         alias = Some(entry.name);
                     }
@@ -1703,42 +1708,31 @@ fn malformed_lfn_start_sequences_do_not_panic_or_resolve() {
                 })
                 .expect("lookup alias");
             let alias = alias.expect("alias");
+            let short = manager.find_directory_entry(dir, alias).expect("short entry");
+            assert_eq!(short.entry_offset, 96, "one LFN after dot entries");
 
-            // Locate the first (start) LFN slot in the run preceding its SFN.
-            let mut pending = Vec::new();
-            let mut start = None;
-            manager
-                .iterate_dir(root, |entry| {
-                    if entry.attributes.is_lfn() {
-                        pending.push((entry.entry_block, entry.entry_offset));
-                    } else if entry.name == alias {
-                        start = pending.first().copied();
-                        return ControlFlow::Break(());
-                    } else {
-                        pending.clear();
-                    }
-                    ControlFlow::Continue(())
-                })
-                .expect("scan entries");
-            let (block_idx, offset) = start.expect("start LFN slot");
             manager.device(|disk| {
                 let mut sector = [Block::new()];
-                disk.read(&mut sector, block_idx).expect("read LFN");
-                sector[0].contents[offset as usize] = raw_sequence;
-                disk.write(&sector, block_idx).expect("corrupt LFN start");
+                disk.read(&mut sector, short.entry_block).expect("read LFN");
+                let offset = short.entry_offset as usize - 32;
+                assert_eq!(sector[0].contents[offset + 11], 0x0F);
+                assert_eq!(sector[0].contents[offset], 0x41);
+                sector[0].contents[offset] = raw_sequence;
+                disk.write(&sector, short.entry_block).expect("corrupt start");
             });
 
             assert!(
                 matches!(
-                    manager.open_long_name_file_in_dir(root, long_name, Mode::ReadOnly),
+                    manager.open_long_name_file_in_dir(dir, long_name, Mode::ReadOnly),
                     Err(embedded_sdmmc::Error::NotFound)
                 ),
                 "partition {partition}, sequence {raw_sequence:#x} should be ignored"
             );
             let file = manager
-                .open_file_in_dir(root, alias, Mode::ReadOnly)
+                .open_file_in_dir(dir, alias, Mode::ReadOnly)
                 .expect("short alias still opens");
             manager.close_file(file).expect("close alias");
+            manager.close_dir(dir).expect("close directory");
             manager.close_dir(root).expect("close root");
             manager.close_volume(volume).expect("close volume");
         }
