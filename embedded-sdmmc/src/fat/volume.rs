@@ -574,7 +574,7 @@ pub struct FatVolume {
     pub(crate) free_clusters_count: Option<u32>,
     /// Whether free-space accounting changed after mounting. Unknown or
     /// invalid FSInfo values alone must not force a write on a read-only close.
-    fsinfo_dirty: bool,
+    pub(crate) fsinfo_dirty: bool,
     /// Number of the next expected free cluster
     pub(crate) next_free_cluster: Option<ClusterId>,
     /// Total number of clusters

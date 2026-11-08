@@ -2773,6 +2773,7 @@ mod tests {
                     second_fat_start: Some(BlockCount(32 + 0x0000_1D80)),
                     name: fat::VolumeName::create_from_str("Pictures").unwrap(),
                     free_clusters_count: None,
+                    fsinfo_dirty: false,
                     next_free_cluster: None,
                     cluster_count: 965_788,
                     fat_specific_info: fat::FatSpecificInfo::Fat32(fat::Fat32Info {
