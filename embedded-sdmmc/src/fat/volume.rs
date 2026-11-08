@@ -598,13 +598,20 @@ impl FatVolume {
                 let block = block_cache
                     .read_mut(fat32_info.info_location)
                     .map_err(Error::DeviceError)?;
-                // FSInfo uses 0xFFFF_FFFF to record an unknown free count.
-                // Leaving the previous value in place would resurrect stale
-                // accounting after a count overflows or is invalidated.
-                let count = self.free_clusters_count.unwrap_or(u32::MAX);
-                block[488..492].copy_from_slice(&count.to_le_bytes());
-                if let Some(next_free_cluster) = self.next_free_cluster {
-                    block[492..496].copy_from_slice(&next_free_cluster.0.to_le_bytes());
+                // The unknown-count sentinel must replace a stale count, but
+                // an unchanged (possibly read-only) volume needs no write.
+                let count = self.free_clusters_count.unwrap_or(u32::MAX).to_le_bytes();
+                let next = self.next_free_cluster.map(|c| c.0.to_le_bytes());
+                if &block[488..492] == count.as_slice()
+                    && next
+                        .as_ref()
+                        .is_none_or(|value| &block[492..496] == value.as_slice())
+                {
+                    return Ok(());
+                }
+                block[488..492].copy_from_slice(&count);
+                if let Some(next) = next {
+                    block[492..496].copy_from_slice(&next);
                 }
                 trace!("Writing info sector");
                 block_cache.write_back()?;
@@ -1357,10 +1364,10 @@ impl FatVolume {
     {
         match &self.fat_specific_info {
             FatSpecificInfo::Fat16(fat16_info) => {
-                self.iterate_fat16(dir_info, fat16_info, block_cache, |de, _| func(de))
+                self.iterate_fat16(dir_info, fat16_info, block_cache, |de, _, _| func(de))
             }
             FatSpecificInfo::Fat32(fat32_info) => {
-                self.iterate_fat32(dir_info, fat32_info, block_cache, |de, _| func(de))
+                self.iterate_fat32(dir_info, fat32_info, block_cache, |de, _, _| func(de))
             }
         }
     }
@@ -1373,7 +1380,9 @@ impl FatVolume {
         func: F,
     ) -> Result<(), Error<D::Error>>
     where
-        F: FnMut(&DirEntry, &OnDiskDirEntry) -> ControlFlow<()>,
+        // The flag says whether this valid slot directly follows the
+        // previous valid slot, without an intervening deleted slot.
+        F: FnMut(&DirEntry, &OnDiskDirEntry, bool) -> ControlFlow<()>,
         D: BlockDevice,
     {
         match &self.fat_specific_info {
@@ -1442,13 +1451,16 @@ impl FatVolume {
                             next: sequence - 1,
                         }
                     }
-                    (false, 0x01, SeqState::Remaining { csum, next }) if next == sequence => {
+                    (false, 0x01, SeqState::Remaining { csum: expected, next })
+                        if next == sequence && csum == expected =>
+                    {
                         lfn_buffer.push(&buffer);
                         SeqState::Complete { csum }
                     }
-                    (false, sequence, SeqState::Remaining { csum, next })
+                    (false, sequence, SeqState::Remaining { csum: expected, next })
                         if (0x01..MAX_LFN_ENTRIES as u8).contains(&sequence)
-                            && next == sequence =>
+                            && next == sequence
+                            && csum == expected =>
                     {
                         lfn_buffer.push(&buffer);
                         SeqState::Remaining {
@@ -1466,20 +1478,31 @@ impl FatVolume {
         }
 
         let mut seq_state = SeqState::Waiting;
-        self.iterate_dir_internal(block_cache, dir_info, |de, odde| {
+        self.iterate_dir_internal(block_cache, dir_info, |de, odde, adjacent| {
+            // Invalid/deleted entries aren't emitted by the iterator, but
+            // they still break physical adjacency of an LFN chain.
+            if !adjacent {
+                seq_state = SeqState::Waiting;
+                lfn_buffer.clear();
+            }
             if let Some((start, this_seqno, csum, buffer)) = odde.lfn_contents() {
                 seq_state = seq_state.update(lfn_buffer, start, this_seqno, csum, buffer);
                 ControlFlow::Continue(())
-            } else if let SeqState::Complete { csum } = seq_state {
-                if csum == de.name.csum() {
-                    // Checksum is good, and all the pieces are there
-                    func(de, Some(lfn_buffer.as_str()))
-                } else {
-                    // Checksum was bad
-                    func(de, None)
-                }
             } else {
-                func(de, None)
+                let outcome = if let SeqState::Complete { csum } = seq_state {
+                    if csum == de.name.csum() {
+                        func(de, Some(lfn_buffer.as_str()))
+                    } else {
+                        func(de, None)
+                    }
+                } else {
+                    func(de, None)
+                };
+                // A completed LFN belongs only to the immediately following
+                // short entry, never to another entry with the same checksum.
+                seq_state = SeqState::Waiting;
+                lfn_buffer.clear();
+                outcome
             }
         })
     }
@@ -1495,7 +1518,7 @@ impl FatVolume {
         mut func: F,
     ) -> Result<(), Error<D::Error>>
     where
-        F: for<'odde> FnMut(&DirEntry, &OnDiskDirEntry<'odde>) -> ControlFlow<()>,
+        F: for<'odde> FnMut(&DirEntry, &OnDiskDirEntry<'odde>, bool) -> ControlFlow<()>,
         D: BlockDevice,
     {
         // Root directories on FAT16 have a fixed size, because they use
@@ -1503,6 +1526,7 @@ impl FatVolume {
         // `first_root_dir_block`). Other directories can have any size
         // as they are made of regular clusters.
         let mut current_cluster = Some(dir_info.cluster);
+        let mut previous_valid = false;
         let mut first_dir_block_num = match dir_info.cluster {
             ClusterId::ROOT_DIR => self.lba_start + fat16_info.first_root_dir_block,
             _ => self.cluster_to_block(dir_info.cluster),
@@ -1528,9 +1552,13 @@ impl FatVolume {
                         // Safe, since Block::LEN always fits on a u32
                         let start = (i * OnDiskDirEntry::LEN) as u32;
                         let entry = dir_entry.get_entry(FatType::Fat16, block_idx, start);
-                        if func(&entry, &dir_entry) == ControlFlow::Break(()) {
+                        let adjacent = previous_valid;
+                        previous_valid = true;
+                        if func(&entry, &dir_entry, adjacent) == ControlFlow::Break(()) {
                             break 'outer;
                         }
+                    } else {
+                        previous_valid = false;
                     }
                 }
             }
@@ -1565,7 +1593,7 @@ impl FatVolume {
         mut func: F,
     ) -> Result<(), Error<D::Error>>
     where
-        F: for<'odde> FnMut(&DirEntry, &OnDiskDirEntry<'odde>) -> ControlFlow<()>,
+        F: for<'odde> FnMut(&DirEntry, &OnDiskDirEntry<'odde>, bool) -> ControlFlow<()>,
         D: BlockDevice,
     {
         // All directories on FAT32 have a cluster chain but the root
@@ -1574,6 +1602,7 @@ impl FatVolume {
             ClusterId::ROOT_DIR => Some(fat32_info.first_root_dir_cluster),
             _ => Some(dir_info.cluster),
         };
+        let mut previous_valid = false;
         'outer: while let Some(cluster) = current_cluster {
             let start_block_idx = self.cluster_to_block(cluster);
             for block_idx in start_block_idx.range(BlockCount(u32::from(self.blocks_per_cluster))) {
@@ -1588,10 +1617,14 @@ impl FatVolume {
                         // Safe, since Block::LEN always fits on a u32
                         let start = (i * OnDiskDirEntry::LEN) as u32;
                         let entry = dir_entry.get_entry(FatType::Fat32, block_idx, start);
-                        if let ControlFlow::Break(_) = func(&entry, &dir_entry) {
+                        let adjacent = previous_valid;
+                        previous_valid = true;
+                        if let ControlFlow::Break(_) = func(&entry, &dir_entry, adjacent) {
                             // Can quit early
                             break 'outer;
                         }
+                    } else {
+                        previous_valid = false;
                     }
                 }
             }
@@ -1773,7 +1806,7 @@ impl FatVolume {
     {
         // The one-entry long name just seen, waiting for its short entry.
         let mut long: Option<(u8, [u16; LFN_CHARS_PER_ENTRY])> = None;
-        self.iterate_dir_internal(block_cache, dir_info, |de, odde| {
+        self.iterate_dir_internal(block_cache, dir_info, |de, odde, adjacent| {
             // Every valid entry, as `find_directory_entry` compares them.
             for (name, flag) in names.iter().zip(taken.iter_mut()) {
                 if de.name == *name {
@@ -1827,7 +1860,13 @@ impl FatVolume {
         // Half of a surrogate pair that straddles the boundary between two
         // entries, waiting for the half that completes it.
         let mut pending_low: Option<u16> = None;
-        self.iterate_dir_internal(block_cache, dir_info, |de, odde| {
+        self.iterate_dir_internal(block_cache, dir_info, |de, odde, adjacent| {
+            // Start entries can begin a new sequence even if the previous
+            // sequence was incomplete. Deleted slots also break adjacency.
+            if !adjacent || odde.lfn_contents().is_some_and(|(start, _, _, _)| start) {
+                state = SeqState::Waiting;
+                pending_low = None;
+            }
             match state {
                 SeqState::Waiting => {
                     debug!("Am waiting for LFN start");
@@ -1927,16 +1966,26 @@ impl FatVolume {
                                 csum,
                             };
                         }
+                    } else {
+                        // A non-continuation entry cannot belong to the LFN
+                        // we were scanning.
+                        state = SeqState::Waiting;
+                        pending_low = None;
                     }
                 }
                 SeqState::Found { csum } => {
-                    let calc_csum = de.name.csum();
-                    if calc_csum == csum {
-                        result = Ok(de.clone());
-                        return ControlFlow::Break(());
-                    } else {
-                        debug!("Bad csum {:02x} != {:02x}", calc_csum, csum);
+                    // Only the very next valid short entry can own this LFN.
+                    if !de.attributes.is_lfn() {
+                        let calc_csum = de.name.csum();
+                        if calc_csum == csum {
+                            result = Ok(de.clone());
+                            return ControlFlow::Break(());
+                        } else {
+                            debug!("Bad csum {:02x} != {:02x}", calc_csum, csum);
+                        }
                     }
+                    state = SeqState::Waiting;
+                    pending_low = None;
                 }
             }
             ControlFlow::Continue(())
