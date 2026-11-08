@@ -1670,3 +1670,77 @@ fn orphaned_lfn_never_matches_a_later_short_entry_with_colliding_checksum() {
         }
     }
 }
+
+#[test]
+fn malformed_lfn_start_sequences_do_not_panic_or_resolve() {
+    for partition in [0, 1] {
+        for raw_sequence in [0x40u8, 0x5F] {
+            let manager = embedded_sdmmc::VolumeManager::new(
+                utils::make_block_device(utils::DISK_SOURCE).expect("disk"),
+                utils::make_time_source(),
+            );
+            let volume = manager
+                .open_raw_volume(embedded_sdmmc::VolumeIdx(partition))
+                .expect("volume");
+            let root = manager.open_root_dir(volume).expect("root");
+            let long_name = "Malformed sequence test book.epub";
+            manager
+                .create_file_in_dir_lfn(root, long_name)
+                .expect("create")
+                .to_file(&manager)
+                .close()
+                .expect("close");
+
+            let mut storage = [0u8; 128];
+            let mut buffer = LfnBuffer::new(&mut storage);
+            let mut alias = None;
+            manager
+                .iterate_dir_lfn(root, &mut buffer, |entry, long| {
+                    if long == Some(long_name) {
+                        alias = Some(entry.name);
+                    }
+                    ControlFlow::Continue(())
+                })
+                .expect("lookup alias");
+            let alias = alias.expect("alias");
+
+            // Locate the first (start) LFN slot in the run preceding its SFN.
+            let mut pending = Vec::new();
+            let mut start = None;
+            manager
+                .iterate_dir(root, |entry| {
+                    if entry.attributes.is_lfn() {
+                        pending.push((entry.entry_block, entry.entry_offset));
+                    } else if entry.name == alias {
+                        start = pending.first().copied();
+                        return ControlFlow::Break(());
+                    } else {
+                        pending.clear();
+                    }
+                    ControlFlow::Continue(())
+                })
+                .expect("scan entries");
+            let (block_idx, offset) = start.expect("start LFN slot");
+            manager.device(|disk| {
+                let mut sector = [Block::new()];
+                disk.read(&mut sector, block_idx).expect("read LFN");
+                sector[0].contents[offset as usize] = raw_sequence;
+                disk.write(&sector, block_idx).expect("corrupt LFN start");
+            });
+
+            assert!(
+                matches!(
+                    manager.open_long_name_file_in_dir(root, long_name, Mode::ReadOnly),
+                    Err(embedded_sdmmc::Error::NotFound)
+                ),
+                "partition {partition}, sequence {raw_sequence:#x} should be ignored"
+            );
+            let file = manager
+                .open_file_in_dir(root, alias, Mode::ReadOnly)
+                .expect("short alias still opens");
+            manager.close_file(file).expect("close alias");
+            manager.close_dir(root).expect("close root");
+            manager.close_volume(volume).expect("close volume");
+        }
+    }
+}

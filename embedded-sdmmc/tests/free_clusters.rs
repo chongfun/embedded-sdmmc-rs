@@ -592,7 +592,9 @@ fn invalidated_fat32_free_count_is_persisted_as_unknown() {
 
 #[test]
 fn closing_unchanged_fat32_fsinfo_does_not_write_to_the_card() {
-    for known_count in [false, true] {
+    // The last value is an invalid count from another filesystem writer.
+    // Mounting discards it, but no mutation must mean no FSInfo write.
+    for count in [u32::MAX, 42u32, u32::MAX - 1] {
         let disk = utils::make_block_device(utils::DISK_SOURCE).expect("disk image");
         let mut block = [Block::new()];
         disk.read(&mut block, BlockIdx(0)).expect("MBR");
@@ -600,7 +602,6 @@ fn closing_unchanged_fat32_fsinfo_does_not_write_to_the_card() {
         disk.read(&mut block, BlockIdx(start)).expect("FAT32 BPB");
         let info_block = BlockIdx(start + u16_at(&block[0], 48));
         disk.read(&mut block, info_block).expect("FSInfo");
-        let count = if known_count { 42u32 } else { u32::MAX };
         block[0].contents[488..492].copy_from_slice(&count.to_le_bytes());
         block[0].contents[492..496].copy_from_slice(&u32::MAX.to_le_bytes());
         disk.write(&block, info_block).expect("set up FSInfo");
@@ -622,7 +623,7 @@ fn closing_unchanged_fat32_fsinfo_does_not_write_to_the_card() {
             assert_eq!(
                 device.writes_seen.get(),
                 0,
-                "known_count={known_count}: FSInfo written without any changes"
+                "count={count}: FSInfo written without any changes"
             );
         });
     }

@@ -1809,3 +1809,109 @@ fn a_batched_move_ignores_an_orphaned_lfn_across_a_deleted_slot() {
         ));
     }
 }
+
+#[test]
+fn short_slot_reuse_never_adopts_an_orphaned_lfn() {
+    // Deletion can commit the SFN first and lose power before retiring its
+    // LFNs. Reusing that SFN slot under a colliding 8-bit checksum must not
+    // resurrect the old long name for an unrelated file.
+    for partition in [0, 1] {
+        for batched in [false, true] {
+            for across_block in [false, true] {
+                let manager = manager();
+                let volume = manager.open_volume(VolumeIdx(partition)).expect("volume");
+                let root = volume.open_root_dir().expect("root");
+                let source = root.open_dir("TEST").expect("source");
+
+                if across_block {
+                    // Two LFN slots at offsets 448 and 480, followed by the
+                    // short entry at offset 0 of the next sector.
+                    let mut aligned = false;
+                    for n in 0..32 {
+                        let filler = format!("F{n:07}.TMP");
+                        let file = root
+                            .open_file_in_dir(filler.as_str(), Mode::ReadWriteCreate)
+                            .expect("filler");
+                        file.close().expect("close filler");
+                        if root.find_directory_entry(filler.as_str()).unwrap().entry_offset == 416 {
+                            aligned = true;
+                            break;
+                        }
+                    }
+                    assert!(aligned, "could not place LFN at the end of a sector");
+                }
+
+                let old_name = "Lost book volume.epub";
+                root.create_file_in_dir_lfn(old_name)
+                    .expect("old long name")
+                    .close()
+                    .expect("close old long name");
+                let mut storage = [0u8; 128];
+                let mut buffer = embedded_sdmmc::LfnBuffer::new(&mut storage);
+                let mut alias = None;
+                root.iterate_dir_lfn(&mut buffer, |entry, long| {
+                    if long == Some(old_name) {
+                        alias = Some(entry.name);
+                    }
+                    ControlFlow::Continue(())
+                })
+                .expect("find old alias");
+                let alias = alias.expect("old alias");
+                let old = root.find_directory_entry(alias).expect("old entry");
+                if across_block {
+                    assert_eq!(old.entry_offset, 0, "LFN spans a sector boundary");
+                }
+
+                let collision = (0..=0xFFFF)
+                    .map(|n| format!("C{n:07X}.DAT"))
+                    .find(|candidate| {
+                        let short = ShortFileName::create_from_str(candidate).unwrap();
+                        short != alias && short.csum() == alias.csum()
+                    })
+                    .expect("checksum collision");
+                if batched {
+                    let file = source
+                        .open_file_in_dir(collision.as_str(), Mode::ReadWriteCreate)
+                        .expect("source");
+                    file.write(b"new content").expect("write source");
+                    file.close().expect("close source");
+                }
+
+                manager.device(|disk| {
+                    let mut sector = [Block::new()];
+                    disk.read(&mut sector, old.entry_block).expect("read old SFN");
+                    sector[0].contents[old.entry_offset as usize] = 0xE5;
+                    disk.write(&sector, old.entry_block).expect("delete old SFN");
+                });
+
+                if batched {
+                    let fates = source
+                        .move_files_in_dir(&root, &[collision.as_str()])
+                        .expect("batch move");
+                    assert_eq!(&fates[..], &[MoveFate::Moved]);
+                } else {
+                    let file = root
+                        .open_file_in_dir(collision.as_str(), Mode::ReadWriteCreate)
+                        .expect("short create");
+                    file.write(b"new content").expect("write file");
+                    file.close().expect("close file");
+                }
+
+                let replacement = root
+                    .find_directory_entry(collision.as_str())
+                    .expect("replacement");
+                assert_eq!(replacement.entry_block, old.entry_block);
+                assert_eq!(replacement.entry_offset, old.entry_offset);
+                assert_eq!(read_all(&root, collision.as_str()), b"new content");
+                assert!(
+                    matches!(
+                        root.open_long_name_file_in_dir(old_name, Mode::ReadWriteTruncate),
+                        Err(embedded_sdmmc::Error::NotFound)
+                    ),
+                    "partition={partition}, batched={batched}, across_block={across_block}: orphan LFN adopted replacement"
+                );
+                assert_eq!(read_all(&root, collision.as_str()), b"new content");
+            }
+        }
+    }
+}
