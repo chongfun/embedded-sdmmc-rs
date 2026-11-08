@@ -1683,7 +1683,9 @@ fn malformed_lfn_start_sequences_do_not_panic_or_resolve() {
                 .open_raw_volume(embedded_sdmmc::VolumeIdx(partition))
                 .expect("volume");
             let root = manager.open_root_dir(volume).expect("root");
-            manager.make_dir_in_dir(root, "MALDIR").expect("fresh directory");
+            manager
+                .make_dir_in_dir(root, "MALDIR")
+                .expect("fresh directory");
             let dir = manager.open_dir(root, "MALDIR").expect("open directory");
 
             // In a freshly created directory, '.' and '..' occupy slots
@@ -1708,7 +1710,9 @@ fn malformed_lfn_start_sequences_do_not_panic_or_resolve() {
                 })
                 .expect("lookup alias");
             let alias = alias.expect("alias");
-            let short = manager.find_directory_entry(dir, alias).expect("short entry");
+            let short = manager
+                .find_directory_entry(dir, alias)
+                .expect("short entry");
             assert_eq!(short.entry_offset, 96, "one LFN after dot entries");
 
             manager.device(|disk| {
@@ -1718,7 +1722,8 @@ fn malformed_lfn_start_sequences_do_not_panic_or_resolve() {
                 assert_eq!(sector[0].contents[offset + 11], 0x0F);
                 assert_eq!(sector[0].contents[offset], 0x41);
                 sector[0].contents[offset] = raw_sequence;
-                disk.write(&sector, short.entry_block).expect("corrupt start");
+                disk.write(&sector, short.entry_block)
+                    .expect("corrupt start");
             });
 
             assert!(
