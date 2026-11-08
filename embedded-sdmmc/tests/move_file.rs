@@ -1833,7 +1833,12 @@ fn short_slot_reuse_never_adopts_an_orphaned_lfn() {
                             .open_file_in_dir(filler.as_str(), Mode::ReadWriteCreate)
                             .expect("filler");
                         file.close().expect("close filler");
-                        if root.find_directory_entry(filler.as_str()).unwrap().entry_offset == 416 {
+                        if root
+                            .find_directory_entry(filler.as_str())
+                            .unwrap()
+                            .entry_offset
+                            == 416
+                        {
                             aligned = true;
                             break;
                         }
@@ -1879,9 +1884,11 @@ fn short_slot_reuse_never_adopts_an_orphaned_lfn() {
 
                 manager.device(|disk| {
                     let mut sector = [Block::new()];
-                    disk.read(&mut sector, old.entry_block).expect("read old SFN");
+                    disk.read(&mut sector, old.entry_block)
+                        .expect("read old SFN");
                     sector[0].contents[old.entry_offset as usize] = 0xE5;
-                    disk.write(&sector, old.entry_block).expect("delete old SFN");
+                    disk.write(&sector, old.entry_block)
+                        .expect("delete old SFN");
                 });
 
                 if batched {
