@@ -1730,9 +1730,7 @@ fn a_batched_move_ignores_an_orphaned_lfn_across_a_deleted_slot() {
     // real short entry deliberately has the same 8-bit LFN checksum.
     for partition in [0, 1] {
         let manager = manager();
-        let volume = manager
-            .open_volume(VolumeIdx(partition))
-            .expect("volume");
+        let volume = manager.open_volume(VolumeIdx(partition)).expect("volume");
         let root = volume.open_root_dir().expect("root");
         let source = root.open_dir("TEST").expect("source");
         let name = "S000.BIN";
@@ -1790,9 +1788,11 @@ fn a_batched_move_ignores_an_orphaned_lfn_across_a_deleted_slot() {
         let old = root.find_directory_entry(alias).expect("LFN owner");
         manager.device(|disk| {
             let mut sector = [Block::new()];
-            disk.read(&mut sector, old.entry_block).expect("read short slot");
+            disk.read(&mut sector, old.entry_block)
+                .expect("read short slot");
             sector[0].contents[old.entry_offset as usize] = 0xE5;
-            disk.write(&sector, old.entry_block).expect("retire short slot");
+            disk.write(&sector, old.entry_block)
+                .expect("retire short slot");
         });
 
         let fates = source
