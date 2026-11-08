@@ -1614,7 +1614,9 @@ fn orphaned_lfn_never_matches_a_later_short_entry_with_colliding_checksum() {
             let victim = manager
                 .open_file_in_dir(root, collision.as_str(), Mode::ReadWriteCreate)
                 .expect("create collision");
-            manager.write(victim, b"untouched").expect("write collision");
+            manager
+                .write(victim, b"untouched")
+                .expect("write collision");
             manager.close_file(victim).expect("close collision");
 
             let entry = manager.find_directory_entry(root, alias).expect("original");
@@ -1622,17 +1624,18 @@ fn orphaned_lfn_never_matches_a_later_short_entry_with_colliding_checksum() {
             assert_ne!(replacement.csum(), alias.csum());
             manager.device(|disk| {
                 let mut sector = [Block::new()];
-                disk.read(&mut sector, entry.entry_block).expect("read entry");
+                disk.read(&mut sector, entry.entry_block)
+                    .expect("read entry");
                 let offset = entry.entry_offset as usize;
                 if deleted_short {
                     sector[0].contents[offset] = 0xE5;
                 } else {
                     // A surviving but unrelated short entry must consume
                     // and reset the preceding LFN lookup state.
-                    sector[0].contents[offset..offset + 11]
-                        .copy_from_slice(b"OTHER   DAT");
+                    sector[0].contents[offset..offset + 11].copy_from_slice(b"OTHER   DAT");
                 }
-                disk.write(&sector, entry.entry_block).expect("corrupt entry");
+                disk.write(&sector, entry.entry_block)
+                    .expect("corrupt entry");
             });
 
             assert!(

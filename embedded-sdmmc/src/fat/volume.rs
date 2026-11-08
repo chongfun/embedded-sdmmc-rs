@@ -1451,16 +1451,27 @@ impl FatVolume {
                             next: sequence - 1,
                         }
                     }
-                    (false, 0x01, SeqState::Remaining { csum: expected, next })
-                        if next == sequence && csum == expected =>
-                    {
+                    (
+                        false,
+                        0x01,
+                        SeqState::Remaining {
+                            csum: expected,
+                            next,
+                        },
+                    ) if next == sequence && csum == expected => {
                         lfn_buffer.push(&buffer);
                         SeqState::Complete { csum }
                     }
-                    (false, sequence, SeqState::Remaining { csum: expected, next })
-                        if (0x01..MAX_LFN_ENTRIES as u8).contains(&sequence)
-                            && next == sequence
-                            && csum == expected =>
+                    (
+                        false,
+                        sequence,
+                        SeqState::Remaining {
+                            csum: expected,
+                            next,
+                        },
+                    ) if (0x01..MAX_LFN_ENTRIES as u8).contains(&sequence)
+                        && next == sequence
+                        && csum == expected =>
                     {
                         lfn_buffer.push(&buffer);
                         SeqState::Remaining {

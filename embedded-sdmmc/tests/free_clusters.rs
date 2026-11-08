@@ -612,7 +612,9 @@ fn closing_unchanged_fat32_fsinfo_does_not_write_to_the_card() {
         );
         let volume = manager.open_raw_volume(VolumeIdx(1)).expect("volume");
         manager.device(|device| {
-            device.write_region.set(Some((info_block.0, info_block.0 + 1)));
+            device
+                .write_region
+                .set(Some((info_block.0, info_block.0 + 1)));
             device.fail_write_number.set(Some(1));
         });
         manager.close_volume(volume).expect("close untouched FAT32");
