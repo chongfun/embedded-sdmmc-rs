@@ -1722,3 +1722,88 @@ fn a_batched_move_costs_walks_per_batch_not_per_name() {
         "batched {batch_writes} writes against {single_writes}"
     );
 }
+
+#[test]
+fn a_batched_move_ignores_an_orphaned_lfn_across_a_deleted_slot() {
+    // The fast batch collision scan must apply the same adjacency rule as
+    // ordinary LFN lookup. The orphan has the desired name, and the next
+    // real short entry deliberately has the same 8-bit LFN checksum.
+    for partition in [0, 1] {
+        let manager = manager();
+        let volume = manager
+            .open_volume(VolumeIdx(partition))
+            .expect("volume");
+        let root = volume.open_root_dir().expect("root");
+        let source = root.open_dir("TEST").expect("source");
+        let name = "S000.BIN";
+
+        let staged = source
+            .open_file_in_dir(name, Mode::ReadWriteCreate)
+            .expect("source file");
+        staged.write(b"move this file").expect("source data");
+        staged.close().expect("close source");
+
+        let occupying = root
+            .create_file_in_dir_lfn("s000.bin")
+            .expect("create LFN collision");
+        occupying.close().expect("close occupant");
+
+        let mut storage = [0u8; 64];
+        let mut lfn_buffer = embedded_sdmmc::LfnBuffer::new(&mut storage);
+        let mut alias = None;
+        root.iterate_dir_lfn(&mut lfn_buffer, |entry, long| {
+            if long == Some("s000.bin") {
+                alias = Some(entry.name);
+            }
+            ControlFlow::Continue(())
+        })
+        .expect("find LFN owner");
+        let alias = alias.expect("LFN alias");
+
+        // A valid live LFN must still block the move.
+        assert_eq!(
+            &source.move_files_in_dir(&root, &[name]).expect("collision")[..],
+            &[MoveFate::AlreadyExists]
+        );
+
+        let collision = (0..10_000)
+            .map(|n| format!("C{n:07}.DAT"))
+            .find(|candidate| {
+                let short = ShortFileName::create_from_str(candidate).expect("short name");
+                short != alias && short.csum() == alias.csum()
+            })
+            .expect("find checksum collision");
+        assert_ne!(
+            ShortFileName::create_from_str(name)
+                .expect("source short name")
+                .csum(),
+            alias.csum()
+        );
+        let victim = root
+            .open_file_in_dir(collision.as_str(), Mode::ReadWriteCreate)
+            .expect("create collision short entry");
+        victim.write(b"keep victim").expect("write victim");
+        victim.close().expect("close victim");
+
+        // Simulate an interrupted deletion: its short slot was retired,
+        // but the single LFN entry immediately preceding it was left alive.
+        let old = root.find_directory_entry(alias).expect("LFN owner");
+        manager.device(|disk| {
+            let mut sector = [Block::new()];
+            disk.read(&mut sector, old.entry_block).expect("read short slot");
+            sector[0].contents[old.entry_offset as usize] = 0xE5;
+            disk.write(&sector, old.entry_block).expect("retire short slot");
+        });
+
+        let fates = source
+            .move_files_in_dir(&root, &[name])
+            .expect("batch move over orphaned LFN");
+        assert_eq!(&fates[..], &[MoveFate::Moved]);
+        assert_eq!(read_all(&root, name), b"move this file");
+        assert_eq!(read_all(&root, collision.as_str()), b"keep victim");
+        assert!(matches!(
+            source.find_directory_entry(name),
+            Err(embedded_sdmmc::Error::NotFound)
+        ));
+    }
+}

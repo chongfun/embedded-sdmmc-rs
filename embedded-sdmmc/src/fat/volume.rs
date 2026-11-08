@@ -1818,6 +1818,11 @@ impl FatVolume {
         // The one-entry long name just seen, waiting for its short entry.
         let mut long: Option<(u8, [u16; LFN_CHARS_PER_ENTRY])> = None;
         self.iterate_dir_internal(block_cache, dir_info, |de, odde, adjacent| {
+            // A deleted slot breaks the LFN's physical adjacency to its
+            // owner. The next valid SFN must not inherit that orphaned name.
+            if !adjacent {
+                long = None;
+            }
             // Every valid entry, as `find_directory_entry` compares them.
             for (name, flag) in names.iter().zip(taken.iter_mut()) {
                 if de.name == *name {
