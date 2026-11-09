@@ -667,7 +667,7 @@ fn a_failed_delete_leaves_the_entry_wholly_there_or_wholly_gone() {
             d.write_region.set(Some((cluster_start, cluster_start + 8)));
             d.fail_write_number.set(Some(u32::MAX));
         });
-        root.delete_entry_in_dir(ALIAS).expect("delete");
+        root.unlink_entry_in_dir(ALIAS).expect("delete");
         manager.device(|d| d.writes_seen.get())
     };
     assert!(
@@ -697,7 +697,7 @@ fn a_failed_delete_leaves_the_entry_wholly_there_or_wholly_gone() {
             d.write_region.set(Some((cluster_start, cluster_start + 8)));
             d.fail_write_number.set(Some(failing_write));
         });
-        let outcome = root.delete_entry_in_dir(ALIAS);
+        let outcome = root.unlink_entry_in_dir(ALIAS);
         manager.device(|d| {
             d.write_region.set(None);
             d.fail_write_number.set(None);
@@ -731,6 +731,93 @@ fn a_failed_delete_leaves_the_entry_wholly_there_or_wholly_gone() {
                 "write {failing_write} reported success but the file is still \
                  reachable by one of its names"
             ),
+        }
+    }
+}
+
+#[test]
+fn failed_truncate_reclaim_persists_zero_length_before_fat_changes() {
+    const LONG_NAME: &str = "A long truncation test.epub";
+    const SHORT_NAME: &str = "TRUNC.DAT";
+
+    for partition in [0, 1] {
+        for long_name in [false, true] {
+            let disk = utils::make_block_device(utils::DISK_SOURCE).expect("disk image");
+            let (fat_start, fat_end) = fat_region(&disk, partition);
+            let device = utils::FailRegion::new(disk);
+            let manager: VolumeManager<_, _, 4, 4, 1> =
+                VolumeManager::new_with_limits(device, utils::make_time_source(), 0xAA);
+            let volume = manager
+                .open_raw_volume(VolumeIdx(partition))
+                .expect("volume");
+            let root = manager.open_root_dir(volume).expect("root");
+            let directory = root.to_directory(&manager);
+
+            let file = if long_name {
+                directory
+                    .create_file_in_dir_lfn(LONG_NAME)
+                    .expect("create LFN")
+            } else {
+                directory
+                    .open_file_in_dir(SHORT_NAME, Mode::ReadWriteCreate)
+                    .expect("create SFN")
+            };
+            file.write(&[0xC5; 40_000]).expect("write file");
+            file.close().expect("close file");
+
+            let alias = if long_name {
+                let mut storage = [0u8; 256];
+                let mut buffer = embedded_sdmmc::LfnBuffer::new(&mut storage);
+                let mut alias = None;
+                directory
+                    .iterate_dir_lfn(&mut buffer, |entry, name| {
+                        if name == Some(LONG_NAME) {
+                            alias = Some(entry.name);
+                        }
+                        core::ops::ControlFlow::Continue(())
+                    })
+                    .expect("find LFN alias");
+                alias.expect("LFN alias")
+            } else {
+                embedded_sdmmc::ShortFileName::create_from_str(SHORT_NAME).expect("SFN")
+            };
+            let before = directory.find_directory_entry(alias).expect("entry");
+            assert!(before.size > 0);
+
+            // Let both mirrored writes cut the head to EOF, then reject
+            // the first write freeing the tail. The directory must already
+            // have its zero length, even when reclamation fails partway.
+            manager.device(|d| {
+                d.write_region.set(Some((fat_start, fat_end)));
+                d.writes_seen.set(0);
+                d.fail_write_number.set(Some(3));
+            });
+            let result = if long_name {
+                directory.open_long_name_file_in_dir(LONG_NAME, Mode::ReadWriteTruncate)
+            } else {
+                directory.open_file_in_dir(SHORT_NAME, Mode::ReadWriteTruncate)
+            };
+            assert!(
+                matches!(result, Err(embedded_sdmmc::Error::DeviceError(_))),
+                "partition {partition}, long_name={long_name}: FAT failure not surfaced"
+            );
+            manager.device(|d| {
+                assert!(
+                    d.writes_seen.get() >= 3,
+                    "tail reclamation write was not attempted"
+                );
+                d.write_region.set(None);
+                d.fail_write_number.set(None);
+            });
+
+            let after = directory.find_directory_entry(alias).expect("entry");
+            assert_eq!(after.size, 0, "file length must already be zero");
+            assert_eq!(after.cluster, before.cluster, "retained head changed");
+            // The head remains allocated and now ends the truncated file.
+            assert!(matches!(
+                manager.next_cluster_in_chain(volume, before.cluster),
+                Ok(None)
+            ));
         }
     }
 }
