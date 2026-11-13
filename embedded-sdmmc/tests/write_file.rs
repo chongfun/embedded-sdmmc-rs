@@ -253,7 +253,7 @@ fn delete_frees_clusters_fat32() {
     let before = saved_free_count(&disk);
     // About 318 MiB is free on the FAT32 partition
     let mut volume_mgr = TestVolumeManager::mount(disk);
-    let volume = volume_mgr.open_fat16_volume();
+    let volume = volume_mgr.open_fat32_volume();
     let root_dir = volume_mgr.open_root_dir(volume).expect("open root dir");
     let data = vec![0xCC; 1 * 1024 * 1024];
     for round in 0..80 {
