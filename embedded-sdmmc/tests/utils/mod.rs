@@ -4,9 +4,9 @@
 
 //! Useful library code for tests
 
-use std::io::prelude::*;
+use std::{io::prelude::*, ops::{Deref, DerefMut}};
 
-use embedded_sdmmc::{Block, BlockCount, BlockDevice, BlockIdx};
+use embedded_sdmmc::{Block, BlockCount, BlockDevice, BlockIdx, RawVolume, VolumeIdx, VolumeManager};
 
 /// This file contains:
 ///
@@ -369,6 +369,61 @@ pub fn make_time_source() -> TestTimeSource {
 #[allow(unused)]
 pub fn get_time_source_string() -> &'static str {
     "2003-04-04 13:30:04"
+}
+
+/// The FAT16 partition's starting block in the shared disk fixture.
+pub const FAT16_START: u32 = 2048;
+
+/// FAT32 FSInfo block in the shared disk fixture.
+pub const FAT32_FSINFO: BlockIdx = BlockIdx(264192 + 1);
+
+/// Upstream's test-manager fixture, preserved alongside Calendula's
+/// fault-injecting RamDisk wrappers and their separate test configurations.
+pub struct TestVolumeManager {
+    volume_mgr: VolumeManager<RamDisk<Vec<u8>>, TestTimeSource, 4, 2, 2>,
+}
+
+impl TestVolumeManager {
+    pub fn new() -> Self {
+        let disk = make_block_device(DISK_SOURCE).expect("disk image");
+        Self::mount(disk)
+    }
+
+    pub fn mount(disk: RamDisk<Vec<u8>>) -> Self {
+        Self {
+            volume_mgr: VolumeManager::new_with_limits(disk, make_time_source(), 0xAA00_0000),
+        }
+    }
+
+    pub fn unmount(self) -> RamDisk<Vec<u8>> {
+        self.volume_mgr.free().0
+    }
+
+    pub fn open_fat16_volume(&mut self) -> RawVolume {
+        self.volume_mgr
+            .open_raw_volume(VolumeIdx(0))
+            .expect("open FAT16")
+    }
+
+    pub fn open_fat32_volume(&mut self) -> RawVolume {
+        self.volume_mgr
+            .open_raw_volume(VolumeIdx(1))
+            .expect("open FAT32")
+    }
+}
+
+impl Deref for TestVolumeManager {
+    type Target = VolumeManager<RamDisk<Vec<u8>>, TestTimeSource, 4, 2, 2>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.volume_mgr
+    }
+}
+
+impl DerefMut for TestVolumeManager {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.volume_mgr
+    }
 }
 
 // ****************************************************************************

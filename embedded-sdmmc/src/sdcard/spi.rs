@@ -100,6 +100,15 @@ where
         inner.erase_single_block_enabled()
     }
 
+    /// Retrieve the SD card identification register (CID).
+    ///
+    /// Initializes the card if required, as in upstream's API.
+    pub fn get_card_identification(&self) -> Result<cid::Cid, Error> {
+        let mut inner = self.inner.borrow_mut();
+        inner.check_init()?;
+        inner.read_cid()
+    }
+
     /// Mark the card as requiring a reset.
     ///
     /// The next operation will assume the card has been freshly inserted.
@@ -311,6 +320,20 @@ where
     pub fn erase_single_block_enabled(&mut self) -> Result<bool, Error> {
         let csd = self.read_csd()?;
         Ok(csd.erase_single_block_enabled())
+    }
+
+    /// Read the card identification (CID) register via CMD10.
+    /// Unlike the CSD compatibility exception, a bad CID CRC7 is rejected.
+    fn read_cid(&mut self) -> Result<cid::Cid, Error> {
+        if self.card_type.is_none() {
+            return Err(Error::CardNotFound);
+        }
+        if self.card_command(CmdId::CMD10_SendCid, 0)? != 0 {
+            return Err(Error::RegisterReadError);
+        }
+        let mut cid_raw = [0u8; 16];
+        self.read_data(&mut cid_raw)?;
+        cid::Cid::new(&cid_raw).map_err(|_| Error::RegisterReadError)
     }
 
     /// Read the 'card specific data' block.
@@ -830,6 +853,10 @@ mod tests {
         csd: [u8; 16],
         /// Send the CMD9 block with a CRC16 that does not match it.
         corrupt_csd_crc16: bool,
+        /// The register CMD10 returns.
+        cid: [u8; 16],
+        /// Send the CMD10 block with a CRC16 that does not match it.
+        corrupt_cid_crc16: bool,
     }
 
     /// A transfer the bus reported as failed.
@@ -867,6 +894,17 @@ mod tests {
                     self.outgoing.push_back(0x00);
                     self.outgoing.push_back(DATA_START_BLOCK);
                     self.outgoing.extend(self.csd);
+                    self.outgoing.extend(crc.to_be_bytes());
+                }
+                // CMD10: the CID, as a 16-byte data block.
+                10 => {
+                    let mut crc = crc16(&self.cid);
+                    if self.corrupt_cid_crc16 {
+                        crc ^= 1;
+                    }
+                    self.outgoing.push_back(0x00);
+                    self.outgoing.push_back(DATA_START_BLOCK);
+                    self.outgoing.extend(self.cid);
                     self.outgoing.extend(crc.to_be_bytes());
                 }
                 // CMD17: one block.
@@ -1007,6 +1045,8 @@ mod tests {
                 written: Vec::new(),
                 csd: [0; 16],
                 corrupt_csd_crc16: false,
+                cid: [0; 16],
+                corrupt_cid_crc16: false,
             },
             delayer: NoDelay,
             card_type: Some(CardType::SdhcSdxc),
@@ -1159,6 +1199,40 @@ mod tests {
             Err(Error::Transport)
         ));
         assert_eq!(card.spi.commands, [55, 23, 25, STOP_TRAN_TOKEN]);
+    }
+
+    // A real SD card's CID; its CRC7 is valid.
+    const TEST_CID: [u8; 16] = [
+        0x12, 0x34, 0x56, 0x41, 0x53, 0x54, 0x43, 0x00, 0x20, 0x00, 0x00, 0x0c, 0xef, 0x01, 0x65,
+        0xef,
+    ];
+
+    #[test]
+    fn cid_read_uses_cmd10_and_parses_manufacturing_date() {
+        let mut card = card(None);
+        card.spi.cid = TEST_CID;
+        let cid = card.read_cid().expect("valid CID");
+        assert_eq!(cid.manufacturer_id(), 0x12);
+        assert_eq!(cid.date_year_month(), (22, 5));
+        assert_eq!(card.spi.commands, [10]);
+    }
+
+    #[test]
+    fn cid_crc7_is_strict_even_when_the_csd_has_a_crc7_exception() {
+        let mut card = card(None);
+        card.spi.cid = TEST_CID;
+        card.spi.cid[15] ^= 0x02;
+        assert!(matches!(card.read_cid(), Err(Error::RegisterReadError)));
+        assert_eq!(card.spi.commands, [10]);
+    }
+
+    #[test]
+    fn cid_data_crc16_failure_precedes_register_parse() {
+        let mut card = card(None);
+        card.options.use_crc = true;
+        card.spi.cid = TEST_CID;
+        card.spi.corrupt_cid_crc16 = true;
+        assert!(matches!(card.read_cid(), Err(Error::CrcError(_, _))));
     }
 
     /// A Lexar 633x 32 GB card's register. Every field is right and C_SIZE
