@@ -312,7 +312,7 @@ fn delete_stops_at_a_link_outside_the_volume() {
     let disk = volume_mgr.unmount();
 
     // check we detected the corruption
-    assert!(matches!(result, Err(embedded_sdmmc::Error::FormatError(_))));
+    assert!(matches!(result, Err(embedded_sdmmc::Error::BadCluster)));
 
     // check these did not change
     assert_eq!(fat16_reserved_entries(&disk), reserved);
@@ -358,7 +358,7 @@ fn delete_rejects_a_first_cluster_outside_the_volume() {
     volume_mgr.close_volume(volume).expect("close volume");
     let disk = volume_mgr.unmount();
 
-    assert!(matches!(result, Err(embedded_sdmmc::Error::FormatError(_))));
+    assert!(matches!(result, Err(embedded_sdmmc::Error::BadCluster)));
     // Was it refused before anything changed: the entry is still there, and the?
     // padding entry was not written
     disk.read(&mut block, entry.entry_block).unwrap();
@@ -433,7 +433,7 @@ fn truncate_stops_at_a_link_outside_the_volume() {
     let volume = volume_mgr.open_fat16_volume();
     let root_dir = volume_mgr.open_root_dir(volume).expect("open root dir");
     let result = volume_mgr.open_file_in_dir(root_dir, "64MB.DAT", Mode::ReadWriteTruncate);
-    assert!(matches!(result, Err(embedded_sdmmc::Error::FormatError(_))));
+    assert!(matches!(result, Err(embedded_sdmmc::Error::BadCluster)));
     volume_mgr.close_dir(root_dir).expect("close dir");
     volume_mgr.close_volume(volume).expect("close volume");
     let disk = volume_mgr.unmount();
@@ -479,7 +479,7 @@ fn truncate_rejects_a_first_cluster_outside_the_volume() {
     let volume = volume_mgr.open_fat16_volume();
     let root_dir = volume_mgr.open_root_dir(volume).expect("open root dir");
     let result = volume_mgr.open_file_in_dir(root_dir, "64MB.DAT", Mode::ReadWriteTruncate);
-    assert!(matches!(result, Err(embedded_sdmmc::Error::FormatError(_))));
+    assert!(matches!(result, Err(embedded_sdmmc::Error::BadCluster)));
     volume_mgr.close_dir(root_dir).expect("close dir");
     volume_mgr.close_volume(volume).expect("close volume");
     let disk = volume_mgr.unmount();
@@ -526,7 +526,7 @@ fn truncate_rejects_a_first_link_outside_the_volume() {
     volume_mgr.close_volume(volume).expect("close volume");
     let disk = volume_mgr.unmount();
 
-    assert!(matches!(result, Err(embedded_sdmmc::Error::FormatError(_))));
+    assert!(matches!(result, Err(embedded_sdmmc::Error::BadCluster)));
     // Was it refused before anything changed?
     assert_eq!(fat16_reserved_entries(&disk), reserved);
     assert_eq!(
@@ -538,7 +538,7 @@ fn truncate_rejects_a_first_link_outside_the_volume() {
 }
 
 #[test]
-fn free_count_too_low_becomes_unknown() {
+fn free_count_too_low_stays_pessimistic() {
     let disk = utils::make_block_device(utils::DISK_SOURCE).unwrap();
     force_override_free_count(&disk, 1);
     let mut volume_mgr = TestVolumeManager::mount(disk);
@@ -553,9 +553,11 @@ fn free_count_too_low_becomes_unknown() {
     volume_mgr.close_file(f).expect("close file");
     volume_mgr.close_dir(root_dir).expect("close dir");
     volume_mgr.close_volume(volume).expect("close volume");
-    // 0xFFFF_FFFF is the "unknown" value of the spec
+    // Calendula clamps a free-space hint that would underflow to zero.
+    // Allocation still searches the FAT, so this pessimistic hint is safe;
+    // keeping it at zero rather than "unknown" avoids claiming extra space.
     let disk = volume_mgr.unmount();
-    assert_eq!(saved_free_count(&disk), 0xFFFF_FFFF);
+    assert_eq!(saved_free_count(&disk), 0);
 }
 
 #[test]
