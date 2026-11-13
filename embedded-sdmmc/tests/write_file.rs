@@ -317,10 +317,12 @@ fn delete_stops_at_a_link_outside_the_volume() {
     // check these did not change
     assert_eq!(fat16_reserved_entries(&disk), reserved);
 
-    // We should have freed the first entry though
+    // Calendula validates a FAT successor before clearing its predecessor.
+    // Unlike upstream, the corrupt link is retained for diagnosis/recovery;
+    // the deleted name can leak clusters, but no reserved FAT entry is freed.
     let (fat_block, at) = fat16_entry(&disk, first);
     disk.read(&mut block, fat_block).unwrap();
-    assert_eq!(block[0].contents[at..at + 2], [0, 0]);
+    assert_eq!(block[0].contents[at..at + 2], 1u16.to_le_bytes());
 }
 
 #[test]
