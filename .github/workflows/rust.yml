@@ -17,8 +17,8 @@ jobs:
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        # Always run MSRV too!
-        rust: ["stable", "1.87"]
+        # Test MSRV, Calendula OS pinned Rust, and latest stable.
+        rust: ["1.87", "1.100.0", "stable"]
         features: ['log', 'defmt-log', '""']
     steps:
     - uses: actions/checkout@v4
