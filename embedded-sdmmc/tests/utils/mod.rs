@@ -4,9 +4,14 @@
 
 //! Useful library code for tests
 
-use std::{io::prelude::*, ops::{Deref, DerefMut}};
+use std::{
+    io::prelude::*,
+    ops::{Deref, DerefMut},
+};
 
-use embedded_sdmmc::{Block, BlockCount, BlockDevice, BlockIdx, RawVolume, VolumeIdx, VolumeManager};
+use embedded_sdmmc::{
+    Block, BlockCount, BlockDevice, BlockIdx, RawVolume, VolumeIdx, VolumeManager,
+};
 
 /// This file contains:
 ///
