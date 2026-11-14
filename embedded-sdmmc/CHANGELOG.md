@@ -8,6 +8,8 @@ The format is based on [Keep a Changelog] and this project adheres to [Semantic 
 
 ### Added
 
+- `SdCard::get_card_identification` (CMD10), with CRC7-validated CID and
+  manufacturing-date parsing, synchronized from upstream develop.
 - `move_file_in_dir` and `link_file_in_dir` on `VolumeManager` and `Directory`:
   the short-name counterparts of the long-name move and link. They file the
   exact 8.3 name asked for as a plain entry, where the long-name variants
@@ -30,6 +32,9 @@ The format is based on [Keep a Changelog] and this project adheres to [Semantic 
 
 ### Fixed
 
+- Synchronize with upstream's FAT16/FAT32 allocation bounds, ordinary
+  delete-and-reclaim, truncated-chain validation and long-name lookup fixes;
+  retain the fork's additional crash-recovery and LFN integrity guards.
 - `truncate_cluster_chain` did not count the last cluster it freed, so every
   truncation left the free-cluster count one short, and allocation then
   decremented a count of zero while the FAT scan still found space: a panic
